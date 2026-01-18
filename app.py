@@ -1,5 +1,6 @@
 import yaml
 import re
+import traceback
 from collections import defaultdict
 from urllib.parse import urlparse
 
@@ -19,11 +20,6 @@ class AnalyzeRequest(BaseModel):
     rooms: int | None = None
     occupancy: float | None = None
     adr: float | None = None
-
-
-# Load detector definitions safely
-with open("detectors.yaml", "r") as f:
-    DETECTORS = yaml.safe_load(f).get("products", [])
 
 
 def label(conf: float) -> str:
@@ -60,9 +56,7 @@ BROWSER_HEADERS = {
 
 async def fetch_html(url: str):
     """
-    Fetches HTML safely.
-    Returns (html, error_dict). Exactly one will be None.
-    Never raises.
+    Returns (html, error_dict). Never raises.
     """
     try:
         async with httpx.AsyncClient(
@@ -75,14 +69,15 @@ async def fetch_html(url: str):
             if r.status_code >= 400:
                 return None, {
                     "type": "http_error",
-                    "message": f"Upstream returned HTTP {r.status_code}"
+                    "message": f"Upstream returned HTTP {r.status_code}",
+                    "status_code": r.status_code
                 }
 
             ct = r.headers.get("content-type", "")
             if "text/html" not in ct and "application/xhtml+xml" not in ct:
                 return None, {
                     "type": "non_html",
-                    "message": f"Unexpected content type: {ct}"
+                    "message": f"Unexpected content type: {ct}",
                 }
 
             return r.text, None
@@ -95,19 +90,46 @@ async def fetch_html(url: str):
         return None, {"type": "unexpected_error", "message": str(e)}
 
 
-def safe_regex(pattern: str, text: str) -> bool:
+def safe_regex(pattern: str, haystack: str) -> bool:
     try:
-        return re.search(pattern, text, re.I) is not None
+        return re.search(pattern, haystack, re.I) is not None
     except re.error:
         return False
 
 
-def fallback_response(error, model_inputs):
-    opp = opportunity_model(model_inputs)
+def load_detectors():
+    """
+    Loads detectors.yaml safely. Never raises.
+    """
+    try:
+        with open("detectors.yaml", "r") as f:
+            data = yaml.safe_load(f) or {}
+        products = data.get("products", [])
+        if not isinstance(products, list):
+            return []
+        return products
+    except Exception:
+        # If detectors.yaml is missing/malformed, we still keep API alive
+        print("ERROR loading detectors.yaml:\n" + traceback.format_exc())
+        return []
+
+
+def fallback_response(error, model_inputs, url=None):
+    """
+    Always returns valid JSON. Never raises.
+    """
+    try:
+        opp = opportunity_model(model_inputs)
+    except Exception as e:
+        opp = {
+            "assumptions": {"rooms": 60, "occupancy": 0.72, "adr": 140},
+            "annual_opportunity_gbp_range": [0, 0],
+            "error": f"opportunity_model failed: {str(e)}"
+        }
 
     return {
         "analysis": {
-            "url": None,
+            "url": url,
             "detections": [],
             "scores": {
                 "overall_score_0_to_100": None,
@@ -116,23 +138,26 @@ def fallback_response(error, model_inputs):
             "opportunity": opp,
             "error": error,
             "notes": [
-                "Public technology signals could not be retrieved from this website.",
-                "This is common for sites protected by bot mitigation or heavy JavaScript.",
-                "Confirming one internal system will improve accuracy."
+                "Public technology signals could not be processed for this website at this time.",
+                "This may be due to bot protection, heavy JavaScript, rate limits, or an internal processing edge case.",
+                "Confirming one internal system (PMS / booking engine / channel manager / CRM) will improve accuracy."
             ]
         },
         "report_md": (
             "# Hotel Technology & Revenue Readiness Report\n\n"
-            "We couldn’t retrieve public technology signals from the website just now.\n\n"
-            "This does **not** indicate a problem with your systems. Many hotel brands "
-            "restrict automated access.\n\n"
-            "Confirming a booking engine, PMS, or CRM will produce a full consultant-grade report."
+            "We couldn’t complete the automated scan just now.\n\n"
+            "This does **not** indicate a problem with your systems — it’s often caused by sites restricting automated access "
+            "or by a processing edge case.\n\n"
+            "If you confirm your PMS, booking engine, channel manager or CRM/email platform, I’ll regenerate a full consultant-grade report.\n"
         )
     }
 
 
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
+    """
+    Hard guarantee: never throws, never returns 500.
+    """
     url = normalise_url(req.url)
 
     model_inputs = {
@@ -141,72 +166,87 @@ async def analyze(req: AnalyzeRequest):
         "adr": req.adr
     }
 
-    # 1) Fetch HTML safely
-    html, error = await fetch_html(url)
-    if error:
-        return fallback_response(error, model_inputs)
-
     try:
+        # 1) Fetch HTML (safe)
+        html, fetch_error = await fetch_html(url)
+        if fetch_error:
+            return fallback_response(fetch_error, model_inputs, url=url)
+
+        # 2) Parse HTML (safe)
         soup = BeautifulSoup(html, "lxml")
         text = soup.get_text(" ", strip=True)
 
         assets = set()
-        for tag in soup.find_all(["script", "iframe", "img", "a", "link"]):
-            src = tag.get("src") or tag.get("href")
-            if src:
-                assets.add(src)
+        for tag in soup.find_all(["script", "iframe", "img", "a", "link", "form"]):
+            val = tag.get("src") or tag.get("href") or tag.get("action")
+            if val:
+                assets.add(val)
+
+        # 3) Detect tools (safe)
+        detectors = load_detectors()
 
         detections = []
         by_layer = defaultdict(list)
 
-        for product in DETECTORS:
+        for product in detectors:
+            if not isinstance(product, dict):
+                continue
+
+            category = product.get("category") or "Unknown"
+            vendor = product.get("vendor") or "Unknown"
+            prod = product.get("product") or "Unknown"
+            patterns = product.get("patterns", [])
+
             best = 0.0
+            if isinstance(patterns, list):
+                for pattern in patterns:
+                    if not isinstance(pattern, dict):
+                        continue
+                    ptype = pattern.get("type")
+                    value = pattern.get("value")
+                    weight = float(pattern.get("weight", 0) or 0)
 
-            for pattern in product.get("patterns", []):
-                ptype = pattern.get("type")
-                value = pattern.get("value")
-                weight = float(pattern.get("weight", 0))
+                    if not ptype or not value or weight <= 0:
+                        continue
 
-                if not ptype or not value or weight <= 0:
-                    continue
+                    if ptype == "domain_contains":
+                        if any(str(value) in a for a in assets):
+                            best = max(best, weight)
 
-                if ptype == "domain_contains":
-                    if any(value in a for a in assets):
-                        best = max(best, weight)
-
-                elif ptype == "text_regex":
-                    if safe_regex(value, html) or safe_regex(value, text):
-                        best = max(best, weight)
+                    elif ptype == "text_regex":
+                        if safe_regex(str(value), html) or safe_regex(str(value), text):
+                            best = max(best, weight)
 
             if best > 0:
                 det = {
-                    "vendor": product.get("vendor"),
-                    "product": product.get("product"),
-                    "category": product.get("category"),
+                    "vendor": vendor,
+                    "product": prod,
+                    "category": category,
                     "confidence": round(best, 2),
                     "label": label(best)
                 }
                 detections.append(det)
-                by_layer[product["category"]].append(det)
+                by_layer[category].append(det)
 
-        # 2) Score safely
+        # 4) Score + opportunity (safe)
         try:
             scores = score_layers(by_layer)
         except Exception as e:
+            print("ERROR in score_layers:\n" + traceback.format_exc())
             scores = {
                 "overall_score_0_to_100": None,
                 "layer_scores": [],
-                "error": str(e)
+                "error": f"score_layers failed: {str(e)}"
             }
 
-        # 3) Opportunity safely (defaults handled in report.py)
         try:
             opp = opportunity_model(model_inputs)
         except Exception as e:
+            print("ERROR in opportunity_model:\n" + traceback.format_exc())
             opp = {
                 "assumptions": {"rooms": 60, "occupancy": 0.72, "adr": 140},
                 "annual_opportunity_gbp_range": [0, 0],
-                "error": str(e)
+                "error": f"opportunity_model failed: {str(e)}"
             }
 
         analysis = {
@@ -220,17 +260,18 @@ async def analyze(req: AnalyzeRequest):
             ]
         }
 
-        # 4) Render report safely (never crash)
+        # 5) Render report (safe)
         try:
             report_md = render_report_md({
                 "scores": scores,
                 "opportunity": opp
             })
         except Exception as e:
+            print("ERROR in render_report_md:\n" + traceback.format_exc())
             report_md = (
                 "# Hotel Technology & Revenue Readiness Report\n\n"
-                "Analysis completed, but report formatting failed.\n\n"
-                f"Error: {str(e)}"
+                "Analysis completed, but report generation hit a formatting issue.\n\n"
+                f"**Error:** {str(e)}\n"
             )
 
         return {
@@ -239,8 +280,10 @@ async def analyze(req: AnalyzeRequest):
         }
 
     except Exception as e:
-        # Absolute last line of defence — never return 500
+        # Absolute last defence: never return 500
+        print("UNHANDLED ERROR in /analyze:\n" + traceback.format_exc())
         return fallback_response(
-            {"type": "processing_error", "message": str(e)},
-            model_inputs
+            {"type": "unhandled_processing_error", "message": str(e)},
+            model_inputs,
+            url=url
         )
