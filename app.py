@@ -12,6 +12,13 @@ from pydantic import BaseModel
 from scoring import score_layers
 from report import opportunity_model, render_report_md
 
+# Step 1.3+: Benchmarks + interpretation + likely-state + MD weighting + roadmap
+from benchmarks import PEER_BENCHMARKS
+from interpretation import interpret_score
+from inference import LIKELY_STATE_BY_LAYER
+from weighting import STRATEGIC_IMPORTANCE
+from roadmap import ROADMAP
+
 app = FastAPI(title="Hotel Tech Readiness API", version="0.1.0")
 
 
@@ -109,9 +116,60 @@ def load_detectors():
             return []
         return products
     except Exception:
-        # If detectors.yaml is missing/malformed, we still keep API alive
         print("ERROR loading detectors.yaml:\n" + traceback.format_exc())
         return []
+
+
+def build_layer_summary(by_layer: dict) -> dict:
+    """
+    Converts raw detections-by-layer into an MD-friendly layer summary:
+    - visibility: Detected / Not publicly visible
+    - detections: list
+    - likely_state + typical_risk when not visible
+    - strategic_importance + rationale always
+    """
+    layer_order = [
+        "Distribution",
+        "Core Systems",
+        "Guest Data & CRM",
+        "Commercial Execution",
+        "In-Venue Experience",
+        "Operations",
+        "Finance & Reporting",
+    ]
+
+    summary = {}
+    for layer in layer_order:
+        dets = by_layer.get(layer, []) or []
+        importance, rationale = STRATEGIC_IMPORTANCE.get(layer, ("Medium", ""))
+
+        if dets:
+            summary[layer] = {
+                "visibility": "Detected",
+                "strategic_importance": importance,
+                "importance_rationale": rationale,
+                "detections": dets,
+            }
+        else:
+            fallback = LIKELY_STATE_BY_LAYER.get(layer, {})
+            summary[layer] = {
+                "visibility": "Not publicly visible",
+                "strategic_importance": importance,
+                "importance_rationale": rationale,
+                "detections": [],
+                "likely_state": fallback.get("likely_state"),
+                "typical_risk": fallback.get("typical_risk"),
+            }
+
+    return summary
+
+
+def choose_segment(url: str) -> str:
+    """
+    Simple default segment selection. (Later: infer from price point, brand signals, etc.)
+    For now we default to lifestyle/boutique unless the user changes it upstream.
+    """
+    return "lifestyle_boutique"
 
 
 def fallback_response(error, model_inputs, url=None):
@@ -127,6 +185,9 @@ def fallback_response(error, model_inputs, url=None):
             "error": f"opportunity_model failed: {str(e)}"
         }
 
+    segment = choose_segment(url or "")
+    benchmark = PEER_BENCHMARKS.get(segment, PEER_BENCHMARKS["lifestyle_boutique"])
+
     return {
         "analysis": {
             "url": url,
@@ -135,6 +196,14 @@ def fallback_response(error, model_inputs, url=None):
                 "overall_score_0_to_100": None,
                 "layer_scores": []
             },
+            "benchmarks": {
+                "segment": segment,
+                "typical_range": list(benchmark["typical_range"]),
+                "best_in_class": benchmark["best_in_class"],
+                "interpretation": "Score unavailable due to limited public signals."
+            },
+            "layers": build_layer_summary(defaultdict(list)),
+            "roadmap": ROADMAP,
             "opportunity": opp,
             "error": error,
             "notes": [
@@ -226,6 +295,9 @@ async def analyze(req: AnalyzeRequest):
                     "label": label(best)
                 }
                 detections.append(det)
+
+                # IMPORTANT: map raw detector categories into report layers if your YAML uses these
+                # If your detectors.yaml already uses the layer names, this works as-is.
                 by_layer[category].append(det)
 
         # 4) Score + opportunity (safe)
@@ -249,10 +321,26 @@ async def analyze(req: AnalyzeRequest):
                 "error": f"opportunity_model failed: {str(e)}"
             }
 
+        # 5) Benchmarks + interpretation (Step 1.3 onwards)
+        segment = choose_segment(url)
+        benchmark = PEER_BENCHMARKS.get(segment, PEER_BENCHMARKS["lifestyle_boutique"])
+        score_text = interpret_score(scores.get("overall_score_0_to_100"), benchmark)
+
+        # 6) Layer summaries (likely-state + strategic importance)
+        layers = build_layer_summary(by_layer)
+
         analysis = {
             "url": url,
             "detections": detections,
             "scores": scores,
+            "benchmarks": {
+                "segment": segment,
+                "typical_range": list(benchmark["typical_range"]),
+                "best_in_class": benchmark["best_in_class"],
+                "interpretation": score_text
+            },
+            "layers": layers,
+            "roadmap": ROADMAP,
             "opportunity": opp,
             "notes": [
                 "Some hotel systems are not publicly visible and may require confirmation.",
@@ -260,8 +348,13 @@ async def analyze(req: AnalyzeRequest):
             ]
         }
 
-        # 5) Render report (safe)
+        # 7) Render report (safe)
+        # Recommended: update render_report_md to accept full analysis, but this works either way.
         try:
+            # If you've updated report.py to render from full analysis:
+            report_md = render_report_md(analysis)
+        except TypeError:
+            # Backwards compatible: old renderer expects only scores/opportunity
             report_md = render_report_md({
                 "scores": scores,
                 "opportunity": opp
@@ -280,7 +373,6 @@ async def analyze(req: AnalyzeRequest):
         }
 
     except Exception as e:
-        # Absolute last defence: never return 500
         print("UNHANDLED ERROR in /analyze:\n" + traceback.format_exc())
         return fallback_response(
             {"type": "unhandled_processing_error", "message": str(e)},
