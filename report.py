@@ -1,57 +1,65 @@
-def opportunity_model(inputs):
-    """
-    Calculates a conservative annual commercial opportunity range based on
-    rooms, occupancy, and ADR. Defaults are applied when inputs are missing.
-    """
-    rooms = inputs.get("rooms")
-    occupancy = inputs.get("occupancy")
-    adr = inputs.get("adr")
-
-    # Sensible defaults when values are not provided
-    rooms = 60 if rooms is None else rooms
-    occupancy = 0.72 if occupancy is None else occupancy
-    adr = 140 if adr is None else adr
-
-    room_revenue = rooms * 365 * occupancy * adr
-
-    # Conservative improvement range from tech + commercial maturity uplift
-    low = room_revenue * 0.013
-    high = room_revenue * 0.05
-
-    return {
-        "assumptions": {
-            "rooms": rooms,
-            "occupancy": occupancy,
-            "adr": adr
-        },
-        "annual_opportunity_gbp_range": [
-            round(low, 0),
-            round(high, 0)
-        ]
-    }
-
-
 def render_report_md(analysis):
     """
     Renders a consultant-grade readiness report with transparent scoring,
-    opportunity context, and clear disclosures.
+    opportunity context, and clear disclosures — without crashing if score
+    structures differ.
     """
-    scores = analysis["scores"]
+    scores = analysis.get("scores", {}) or {}
     overall = scores.get("overall_score_0_to_100")
-    layers = scores.get("layer_scores", [])
 
-    opp = analysis["opportunity"]
-    low, high = opp["annual_opportunity_gbp_range"]
-    assumptions = opp["assumptions"]
+    # layer_scores can vary by implementation; handle list or dict safely
+    layer_scores = scores.get("layer_scores")
+    if layer_scores is None:
+        layer_scores = scores.get("layers")  # alternate naming
+    if layer_scores is None:
+        layer_scores = []
 
-    # Build score composition lines
-    if layers:
-        layer_lines = "\n".join(
-            f"• {l['layer']}: {l['score']} / {l['max']}"
-            for l in layers
-        )
-    else:
-        layer_lines = "• Score composition unavailable"
+    layers_lines = []
+
+    # Case A: list of dicts
+    if isinstance(layer_scores, list):
+        for item in layer_scores:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("layer") or item.get("name") or item.get("category") or "Layer"
+            score = item.get("score") or item.get("value")
+            maxv = item.get("max") or item.get("out_of") or item.get("maximum")
+            if score is not None and maxv is not None:
+                layers_lines.append(f"• {name}: {score} / {maxv}")
+            elif score is not None:
+                layers_lines.append(f"• {name}: {score}")
+
+    # Case B: dict of layers
+    elif isinstance(layer_scores, dict):
+        for name, val in layer_scores.items():
+            if isinstance(val, dict):
+                score = val.get("score") or val.get("value")
+                maxv = val.get("max") or val.get("out_of") or val.get("maximum")
+                if score is not None and maxv is not None:
+                    layers_lines.append(f"• {name}: {score} / {maxv}")
+                elif score is not None:
+                    layers_lines.append(f"• {name}: {score}")
+            else:
+                # plain number
+                layers_lines.append(f"• {name}: {val}")
+
+    if not layers_lines:
+        layers_lines = ["• Score composition unavailable (confirm core systems to improve accuracy)"]
+
+    opp = analysis.get("opportunity", {}) or {}
+    rng = opp.get("annual_opportunity_gbp_range") or [0, 0]
+    low, high = rng[0], rng[1]
+
+    assumptions = opp.get("assumptions", {}) or {}
+    rooms = assumptions.get("rooms", 60)
+    occupancy = assumptions.get("occupancy", 0.72)
+    adr = assumptions.get("adr", 140)
+
+    # Safe formatting
+    try:
+        occ_pct = float(occupancy) * 100
+    except Exception:
+        occ_pct = 72.0
 
     return f"""
 # Hotel Technology & Revenue Readiness Assessment
@@ -61,7 +69,7 @@ def render_report_md(analysis):
 **Technology Readiness Score:** {overall} / 100
 
 **Score composition:**
-{layer_lines}
+{chr(10).join(layers_lines)}
 
 **Estimated Annual Opportunity:** £{int(low):,} – £{int(high):,}
 
@@ -79,9 +87,9 @@ This assessment provides a neutral, data-driven view of technology and commercia
 
 ## Commercial assumptions used
 
-- Rooms: {assumptions['rooms']}
-- Occupancy: {assumptions['occupancy'] * 100:.0f}%
-- ADR: £{assumptions['adr']}
+- Rooms: {rooms}
+- Occupancy: {occ_pct:.0f}%
+- ADR: £{adr}
 
 Defaults are applied when inputs are not provided to avoid overstating impact.
 
