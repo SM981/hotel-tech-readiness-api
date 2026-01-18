@@ -1,0 +1,57 @@
+version: 1
+products:
+  - vendor: SiteMinder
+    product: SiteMinder Booking Engine
+    category: Distribution
+    patterns:
+      - type: domain_contains
+        value: thebookingbutton.com
+        weight: 0.95
+
+  - vendor: STAAH
+    product: STAAH Booking / Channel Tech
+    category: Distribution
+    patterns:
+      - type: domain_contains
+        value: staah.com
+        weight: 0.9
+
+  - vendor: Guestline
+    product: Guestline Booking / PMS Signals
+    category: Core Systems
+    patterns:
+      - type: domain_contains
+        value: guestline.net
+        weight: 0.85
+
+  - vendor: Mews
+    product: Mews PMS / Guest Journey Signals
+    category: Core Systems
+    patterns:
+      - type: domain_contains
+        value: mews.li
+        weight: 0.9
+
+  - vendor: Revinate
+    product: Revinate CRM / Reputation
+    category: Guest Data & CRM
+    patterns:
+      - type: domain_contains
+        value: revinate.com
+        weight: 0.8
+
+  - vendor: Google
+    product: Google Tag Manager
+    category: Commercial Execution
+    patterns:
+      - type: text_regex
+        value: "googletagmanager.com/gtm.js"
+        weight: 0.9
+
+  - vendor: Google
+    product: Google Analytics
+    category: Commercial Execution
+    patterns:
+      - type: text_regex
+        value: "google-analytics.com|gtag\\("
+        weight: 0.75
