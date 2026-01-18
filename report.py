@@ -1,10 +1,16 @@
 def opportunity_model(inputs):
-    rooms = inputs.get("rooms", 60)
-    occupancy = inputs.get("occupancy", 0.72)
-    adr = inputs.get("adr", 140)
+    # Use sensible defaults when values are missing / None
+    rooms = inputs.get("rooms")
+    occupancy = inputs.get("occupancy")
+    adr = inputs.get("adr")
+
+    rooms = 60 if rooms is None else rooms
+    occupancy = 0.72 if occupancy is None else occupancy
+    adr = 140 if adr is None else adr
 
     room_revenue = rooms * 365 * occupancy * adr
 
+    # Conservative improvement range for tech + commercial maturity uplift
     low = room_revenue * 0.013
     high = room_revenue * 0.05
 
@@ -19,6 +25,7 @@ def opportunity_model(inputs):
             round(high, 0)
         ]
     }
+
 
 def render_report_md(analysis):
     score = analysis["scores"]["overall_score_0_to_100"]
