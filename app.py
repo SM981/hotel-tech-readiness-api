@@ -21,8 +21,9 @@ class AnalyzeRequest(BaseModel):
     adr: float | None = None
 
 
+# Load detector definitions safely
 with open("detectors.yaml", "r") as f:
-    DETECTORS = yaml.safe_load(f)["products"]
+    DETECTORS = yaml.safe_load(f).get("products", [])
 
 
 def label(conf: float) -> str:
@@ -58,6 +59,11 @@ BROWSER_HEADERS = {
 
 
 async def fetch_html(url: str):
+    """
+    Fetches HTML safely.
+    Returns (html, error_dict). Exactly one will be None.
+    Never raises.
+    """
     try:
         async with httpx.AsyncClient(
             headers=BROWSER_HEADERS,
@@ -65,10 +71,15 @@ async def fetch_html(url: str):
             timeout=30
         ) as client:
             r = await client.get(url)
-            r.raise_for_status()
+
+            if r.status_code >= 400:
+                return None, {
+                    "type": "http_error",
+                    "message": f"Upstream returned HTTP {r.status_code}"
+                }
 
             ct = r.headers.get("content-type", "")
-            if "text/html" not in ct:
+            if "text/html" not in ct and "application/xhtml+xml" not in ct:
                 return None, {
                     "type": "non_html",
                     "message": f"Unexpected content type: {ct}"
@@ -76,21 +87,19 @@ async def fetch_html(url: str):
 
             return r.text, None
 
-    except httpx.HTTPStatusError as e:
-        return None, {
-            "type": "http_error",
-            "message": f"Upstream returned HTTP {e.response.status_code}"
-        }
     except httpx.TimeoutException:
-        return None, {
-            "type": "timeout",
-            "message": "Upstream request timed out"
-        }
+        return None, {"type": "timeout", "message": "Upstream request timed out"}
     except httpx.RequestError as e:
-        return None, {
-            "type": "request_error",
-            "message": str(e)
-        }
+        return None, {"type": "request_error", "message": str(e)}
+    except Exception as e:
+        return None, {"type": "unexpected_error", "message": str(e)}
+
+
+def safe_regex(pattern: str, text: str) -> bool:
+    try:
+        return re.search(pattern, text, re.I) is not None
+    except re.error:
+        return False
 
 
 def fallback_response(error, model_inputs):
@@ -98,6 +107,7 @@ def fallback_response(error, model_inputs):
 
     return {
         "analysis": {
+            "url": None,
             "detections": [],
             "scores": {
                 "overall_score_0_to_100": None,
@@ -106,24 +116,17 @@ def fallback_response(error, model_inputs):
             "opportunity": opp,
             "error": error,
             "notes": [
-                "Public technology signals could not be retrieved from this site.",
-                "This commonly occurs on enterprise or brand websites that restrict automated access.",
-                "A short manual verification will produce a more accurate assessment."
+                "Public technology signals could not be retrieved from this website.",
+                "This is common for sites protected by bot mitigation or heavy JavaScript.",
+                "Confirming one internal system will improve accuracy."
             ]
         },
         "report_md": (
             "# Hotel Technology & Revenue Readiness Report\n\n"
             "We couldn’t retrieve public technology signals from the website just now.\n\n"
             "This does **not** indicate a problem with your systems. Many hotel brands "
-            "restrict automated access or require JavaScript rendering.\n\n"
-            "## What happens next\n"
-            "- If you share known systems (PMS, booking engine, channel manager, CRM, RMS), "
-            "I’ll produce a full consultant-grade report.\n"
-            "- You can also confirm rooms, occupancy, and ADR to refine opportunity ranges.\n\n"
-            "## Methodology & disclosure\n"
-            "- Public website signals only (where accessible)\n"
-            "- No access to private systems or guest data\n"
-            "- Findings should be verified\n"
+            "restrict automated access.\n\n"
+            "Confirming a booking engine, PMS, or CRM will produce a full consultant-grade report."
         )
     }
 
@@ -138,69 +141,106 @@ async def analyze(req: AnalyzeRequest):
         "adr": req.adr
     }
 
+    # 1) Fetch HTML safely
     html, error = await fetch_html(url)
     if error:
         return fallback_response(error, model_inputs)
 
-    soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(" ", strip=True)
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text(" ", strip=True)
 
-    assets = set()
-    for tag in soup.find_all(["script", "iframe", "img", "a", "link"]):
-        src = tag.get("src") or tag.get("href")
-        if src:
-            assets.add(src)
+        assets = set()
+        for tag in soup.find_all(["script", "iframe", "img", "a", "link"]):
+            src = tag.get("src") or tag.get("href")
+            if src:
+                assets.add(src)
 
-    detections = []
-    by_layer = defaultdict(list)
+        detections = []
+        by_layer = defaultdict(list)
 
-    for product in DETECTORS:
-        best = 0.0
+        for product in DETECTORS:
+            best = 0.0
 
-        for pattern in product.get("patterns", []):
-            ptype = pattern.get("type")
-            value = pattern.get("value")
-            weight = float(pattern.get("weight", 0))
+            for pattern in product.get("patterns", []):
+                ptype = pattern.get("type")
+                value = pattern.get("value")
+                weight = float(pattern.get("weight", 0))
 
-            if ptype == "domain_contains":
-                if any(value in a for a in assets):
-                    best = max(best, weight)
+                if not ptype or not value or weight <= 0:
+                    continue
 
-            elif ptype == "text_regex":
-                if re.search(value, html, re.I) or re.search(value, text, re.I):
-                    best = max(best, weight)
+                if ptype == "domain_contains":
+                    if any(value in a for a in assets):
+                        best = max(best, weight)
 
-        if best > 0:
-            det = {
-                "vendor": product.get("vendor"),
-                "product": product.get("product"),
-                "category": product.get("category"),
-                "confidence": round(best, 2),
-                "label": label(best)
+                elif ptype == "text_regex":
+                    if safe_regex(value, html) or safe_regex(value, text):
+                        best = max(best, weight)
+
+            if best > 0:
+                det = {
+                    "vendor": product.get("vendor"),
+                    "product": product.get("product"),
+                    "category": product.get("category"),
+                    "confidence": round(best, 2),
+                    "label": label(best)
+                }
+                detections.append(det)
+                by_layer[product["category"]].append(det)
+
+        # 2) Score safely
+        try:
+            scores = score_layers(by_layer)
+        except Exception as e:
+            scores = {
+                "overall_score_0_to_100": None,
+                "layer_scores": [],
+                "error": str(e)
             }
-            detections.append(det)
-            by_layer[product["category"]].append(det)
 
-    scores = score_layers(by_layer)
-    opp = opportunity_model(model_inputs)
+        # 3) Opportunity safely (defaults handled in report.py)
+        try:
+            opp = opportunity_model(model_inputs)
+        except Exception as e:
+            opp = {
+                "assumptions": {"rooms": 60, "occupancy": 0.72, "adr": 140},
+                "annual_opportunity_gbp_range": [0, 0],
+                "error": str(e)
+            }
 
-    analysis = {
-        "url": url,
-        "detections": detections,
-        "scores": scores,
-        "opportunity": opp,
-        "notes": [
-            "Some hotel systems do not expose public signals and may appear as Unknown.",
-            "Confidence labels reflect strength of public evidence only."
-        ]
-    }
+        analysis = {
+            "url": url,
+            "detections": detections,
+            "scores": scores,
+            "opportunity": opp,
+            "notes": [
+                "Some hotel systems are not publicly visible and may require confirmation.",
+                "Confidence labels reflect public signal strength only."
+            ]
+        }
 
-    report_md = render_report_md({
-        "scores": scores,
-        "opportunity": opp
-    })
+        # 4) Render report safely (never crash)
+        try:
+            report_md = render_report_md({
+                "scores": scores,
+                "opportunity": opp
+            })
+        except Exception as e:
+            report_md = (
+                "# Hotel Technology & Revenue Readiness Report\n\n"
+                "Analysis completed, but report formatting failed.\n\n"
+                f"Error: {str(e)}"
+            )
 
-    return {
-        "analysis": analysis,
-        "report_md": report_md
-    }
+        return {
+            "analysis": analysis,
+            "report_md": report_md
+        }
+
+    except Exception as e:
+        # Absolute last line of defence — never return 500
+        return fallback_response(
+            {"type": "processing_error", "message": str(e)},
+            model_inputs
+        )
