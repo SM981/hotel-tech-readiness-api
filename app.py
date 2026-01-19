@@ -28,20 +28,21 @@ from roadmap import ROADMAP
 logger = logging.getLogger("hotel_tech_readiness")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Hotel Tech Readiness API", version="0.3.0")
+app = FastAPI(title="Hotel Tech Readiness API", version="0.4.0")
 
 # ----------------------------
 # OpenAPI Models (important for GPT Actions)
 # ----------------------------
 class AnalyzeRequest(BaseModel):
     url: str
+    competitor_url: str | None = None
 
     # Commercial assumptions (optional)
     rooms: int | None = None
     occupancy: float | None = None
     adr: float | None = None
 
-    # Optional customer-confirmed systems (trust-first, removes "Unknown" where PMS/CRM is private)
+    # Optional customer-confirmed systems (trust-first, improves confidence for private systems)
     pms_vendor: str | None = None
     booking_engine_vendor: str | None = None
     channel_manager_vendor: str | None = None
@@ -51,106 +52,13 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeResponse(BaseModel):
     analysis: Dict[str, Any] = Field(
         ...,
-        description="Full structured analysis object (scores, detections, benchmarks, layers, roadmap, etc.).",
+        description="Full structured analysis object (scores, detections, benchmarks, layers, roadmap, evidence, etc.).",
     )
-    report_md: str = Field(..., description="Consultant-grade report in Markdown.")
+    report_md: str = Field(..., description="C-suite report in Markdown.")
 
 
 # ----------------------------
-# Utilities
-# ----------------------------
-def label(conf: float) -> str:
-    if conf >= 0.85:
-        return "confirmed"
-    if conf >= 0.55:
-        return "probable"
-    if conf > 0:
-        return "possible"
-    return "unknown"
-
-
-def normalise_url(url: str) -> str:
-    url = (url or "").strip()
-    if not url:
-        return url
-    parsed = urlparse(url)
-    if not parsed.scheme:
-        return f"https://{url}"
-    return url
-
-
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/121.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9",
-    "Cache-Control": "no-cache",
-}
-
-
-async def fetch_html(url: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """
-    Returns (html, error_dict). Never raises.
-    """
-    try:
-        async with httpx.AsyncClient(
-            headers=BROWSER_HEADERS, follow_redirects=True, timeout=30
-        ) as client:
-            r = await client.get(url)
-
-            if r.status_code >= 400:
-                return None, {
-                    "type": "http_error",
-                    "message": f"Upstream returned HTTP {r.status_code}",
-                    "status_code": r.status_code,
-                }
-
-            ct = (r.headers.get("content-type") or "").lower()
-            if ("text/html" not in ct) and ("application/xhtml+xml" not in ct):
-                return None, {
-                    "type": "non_html",
-                    "message": f"Unexpected content type: {ct}",
-                }
-
-            return r.text, None
-
-    except httpx.TimeoutException:
-        return None, {"type": "timeout", "message": "Upstream request timed out"}
-    except httpx.RequestError as e:
-        return None, {"type": "request_error", "message": str(e)}
-    except Exception as e:
-        return None, {"type": "unexpected_error", "message": str(e)}
-
-
-def safe_regex(pattern: str, haystack: str) -> bool:
-    try:
-        return re.search(pattern, haystack, re.I) is not None
-    except re.error:
-        return False
-
-
-@lru_cache(maxsize=1)
-def load_detectors() -> List[Dict[str, Any]]:
-    """
-    Loads detectors.yaml safely. Cached. Never raises.
-    """
-    try:
-        with open("detectors.yaml", "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        products = data.get("products", [])
-        if not isinstance(products, list):
-            return []
-        return [p for p in products if isinstance(p, dict)]
-    except Exception:
-        logger.error("ERROR loading detectors.yaml:\n%s", traceback.format_exc())
-        return []
-
-
-# ----------------------------
-# Layer mapping (detectors.yaml categories -> canonical report layers)
+# Canonical layers
 # ----------------------------
 CANONICAL_LAYER_ORDER = [
     "Distribution",
@@ -162,6 +70,7 @@ CANONICAL_LAYER_ORDER = [
     "Finance & Reporting",
 ]
 
+# detectors.yaml category mapping -> canonical layers
 CATEGORY_TO_LAYER = {
     # Distribution
     "distribution": "Distribution",
@@ -220,6 +129,55 @@ CATEGORY_TO_LAYER = {
 }
 
 
+# ----------------------------
+# HTTP safety + crawl policy
+# ----------------------------
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
+
+CRAWL_TIMEOUT = 25
+MAX_PAGES = 16                 # bounded crawl: homepage + robots + sitemap + ~12 internal
+MAX_INTERNAL_LINKS = 14
+MAX_REDIRECTS = 6
+MAX_TEXT_CHARS = 600_000       # cap blob size for regex scanning
+MAX_COOKIE_KEYS = 80
+
+
+def normalise_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return url
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        return f"https://{url}"
+    return url
+
+
+def safe_regex(pattern: str, haystack: str) -> bool:
+    try:
+        return re.search(pattern, haystack, re.I) is not None
+    except re.error:
+        return False
+
+
+def label(conf: float) -> str:
+    if conf >= 0.85:
+        return "confirmed"
+    if conf >= 0.55:
+        return "probable"
+    if conf > 0:
+        return "possible"
+    return "unknown"
+
+
 def map_category_to_layer(category: str) -> str:
     c = (category or "").strip().lower()
     if not c:
@@ -229,11 +187,29 @@ def map_category_to_layer(category: str) -> str:
     return CATEGORY_TO_LAYER.get(c, "Commercial Execution")
 
 
+@lru_cache(maxsize=1)
+def load_detectors() -> List[Dict[str, Any]]:
+    """
+    Loads detectors.yaml safely. Cached. Never raises.
+    """
+    try:
+        with open("detectors.yaml", "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        products = data.get("products", [])
+        if not isinstance(products, list):
+            return []
+        return [p for p in products if isinstance(p, dict)]
+    except Exception:
+        logger.error("ERROR loading detectors.yaml:\n%s", traceback.format_exc())
+        return []
+
+
 # ----------------------------
-# Customer-confirmed injection (reduces Unknowns honestly)
+# Customer-confirmed injection
 # ----------------------------
 def inject_confirmed_system(
     by_layer: Dict[str, List[Dict[str, Any]]],
+    detections: List[Dict[str, Any]],
     vendor: Optional[str],
     layer: str,
     category: str,
@@ -253,69 +229,57 @@ def inject_confirmed_system(
         "label": "confirmed",
         "source": "customer_confirmed",
     }
-    if layer not in by_layer:
-        by_layer[layer] = []
-    by_layer[layer].append(det)
+    by_layer.setdefault(layer, []).append(det)
+    detections.append(det)
 
 
 # ----------------------------
-# MD-grade report enhancers
+# Segment inference (kept conservative)
 # ----------------------------
-@dataclass
-class SegmentInference:
-    segment: str
-    confidence: str
-    evidence: List[str]
-    implications: List[str]
-
-
 _LUXURY_CUES = [
-    "grand", "luxury", "five-star", "5-star", "spa", "afternoon tea",
-    "suite", "heritage", "historic", "fine dining", "champagne",
+    "luxury", "five-star", "5-star", "spa", "suite", "heritage",
+    "fine dining", "champagne", "afternoon tea",
 ]
-_DESTINATION_CUES = [
-    "york", "leeds", "cathedral", "city centre", "city center", "landmark",
-    "rail", "station", "minutes from", "walk to",
+_URBAN_CUES = [
+    "city centre", "city center", "station", "minutes from", "walk to",
+    "cathedral", "shopping", "business", "conference",
 ]
 
 
 def infer_hotel_segment(public_text: str, url: str = "") -> Dict[str, Any]:
-    """
-    Conservative, explainable segment inference from public text signals.
-    """
     text = (public_text or "").lower()
     u = (url or "").lower()
 
     evidence: List[str] = []
     luxury_hits = [c for c in _LUXURY_CUES if c in text]
-    dest_hits = [c for c in _DESTINATION_CUES if (c in text) or (c in u)]
+    urban_hits = [c for c in _URBAN_CUES if (c in text) or (c in u)]
 
     if luxury_hits:
         evidence.append(f"Luxury cues: {', '.join(sorted(set(luxury_hits))[:6])}")
-    if dest_hits:
-        evidence.append(f"Destination/urban cues: {', '.join(sorted(set(dest_hits))[:6])}")
+    if urban_hits:
+        evidence.append(f"Urban/business cues: {', '.join(sorted(set(urban_hits))[:6])}")
 
-    if luxury_hits and dest_hits:
+    if luxury_hits and urban_hits:
         segment = "Upper-upscale / luxury city hotel"
         confidence = "Medium"
         implications = [
-            "Likely multiple revenue centres (rooms + F&B + events) → guest data fragmentation risk is high.",
-            "Attribution and channel mix are typically complex → booking-engine conversion plumbing is a common leak.",
-            "Integration health matters more than tool count → map data flow before changing vendors.",
+            "Multiple revenue centres likely → guest data fragmentation risk increases.",
+            "Channel mix/attribution complexity typically higher → booking-flow measurement matters.",
+            "Integration depth matters more than tool count → map data flows before vendor change.",
         ]
     elif luxury_hits:
         segment = "Upper-upscale independent hotel"
         confidence = "Low–Medium"
         implications = [
-            "Premium positioning → direct mix and repeat behaviour are high-leverage levers.",
-            "CRM orchestration and identity resolution are often under-utilised.",
-            "Integration health is usually the maturity constraint, not vendor choice.",
+            "Premium positioning → direct mix and repeat behaviour are high-leverage.",
+            "Identity resolution and CRM orchestration often under-utilised.",
+            "Integration health is usually the constraint, not vendor choice.",
         ]
     else:
         segment = "Independent hotel"
         confidence = "Low"
         implications = [
-            "Benchmark context should be broad; focus on foundational tracking + distribution hygiene first.",
+            "Benchmark context should be broad; focus on measurement + distribution hygiene first.",
         ]
 
     if not evidence:
@@ -324,184 +288,631 @@ def infer_hotel_segment(public_text: str, url: str = "") -> Dict[str, Any]:
     return {"segment": segment, "confidence": confidence, "evidence": evidence, "implications": implications}
 
 
-def classify_visibility_vs_capability(
-    by_layer: Dict[str, List[Dict[str, Any]]],
-    segment_inference: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Converts "Unknown" into a useful MD stance:
-    - Visibility gap: likely present but not observable publicly
-    - Potential capability gap: uncertain / not universally present
-    """
-    seg = (segment_inference or {}).get("segment", "").lower()
+# ----------------------------
+# Evidence + crawl extraction
+# ----------------------------
+@dataclass
+class PageResult:
+    url: str
+    status_code: int
+    content_type: str
+    html: str
+    headers: Dict[str, str]
+    cookies: Dict[str, str]
 
-    def likely_exists(layer_name: str) -> bool:
-        if "upscale" in seg or "luxury" in seg:
-            return layer_name in {"Distribution", "Core Systems", "Operations", "Finance & Reporting"}
-        return layer_name in {"Distribution", "Core Systems", "Finance & Reporting"}
 
+def _is_same_site(a: str, b: str) -> bool:
+    try:
+        return (urlparse(a).netloc or "").lower() == (urlparse(b).netloc or "").lower()
+    except Exception:
+        return False
+
+
+def _truncate(s: str, limit: int) -> str:
+    if not s:
+        return ""
+    return s[:limit]
+
+
+def _extract_jsonld(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    for layer in CANONICAL_LAYER_ORDER:
-        dets = by_layer.get(layer, []) or []
-        visible = len(dets) > 0
+    try:
+        for tag in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
+            raw = (tag.string or "").strip()
+            if not raw:
+                continue
+            # Avoid importing json globally; parse defensively.
+            import json
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    for x in data:
+                        if isinstance(x, dict):
+                            out.append(x)
+                elif isinstance(data, dict):
+                    out.append(data)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
 
-        if visible:
-            gap_type = "No visibility gap"
-            rationale = "Public signals indicate systems are observable."
-        else:
-            if likely_exists(layer):
-                gap_type = "Visibility gap (likely present but not observable)"
-                rationale = "Hotels of this type almost always operate these systems; lack of web signals suggests vendor opacity or hidden integrations."
-            else:
-                gap_type = "Potential capability gap (uncertain)"
-                rationale = "Insufficient public evidence and not universally present; treat as an investigation priority."
 
-        out.append({"layer": layer, "gap_type": gap_type, "rationale": rationale})
+def _internal_links_from_soup(base_url: str, soup: BeautifulSoup, limit: int) -> List[str]:
+    links: List[str] = []
+    base_host = (urlparse(base_url).netloc or "").lower()
 
-    return {"gap_summary": out}
-
-
-def build_exec_priorities(
-    segment_inference: Dict[str, Any],
-    by_layer: Dict[str, List[Dict[str, Any]]],
-) -> Dict[str, Any]:
-    """
-    Opinionated 'Top 3' executive priorities.
-    """
-    segment = (segment_inference or {}).get("segment", "").lower()
-    commercial_tools = by_layer.get("Commercial Execution", []) or []
-
-    def _is_confirmed_gtm(d: Dict[str, Any]) -> bool:
-        if not isinstance(d, dict):
+    def _good(href: str) -> bool:
+        if not href:
             return False
-        if d.get("label") != "confirmed":
+        if href.startswith("#"):
             return False
-        p = (d.get("product") or "").lower()
-        v = (d.get("vendor") or "").lower()
-        return ("google tag manager" in p) or ("google tag manager" in v)
+        if href.startswith("mailto:") or href.startswith("tel:"):
+            return False
+        if href.lower().startswith("javascript:"):
+            return False
+        return True
 
-    has_gtm = any(_is_confirmed_gtm(d) for d in commercial_tools)
+    for a in soup.find_all("a"):
+        href = (a.get("href") or "").strip()
+        if not _good(href):
+            continue
+        abs_u = urljoin(base_url, href)
+        host = (urlparse(abs_u).netloc or "").lower()
+        if host != base_host:
+            continue
+        if abs_u not in links:
+            links.append(abs_u)
+        if len(links) >= limit:
+            break
+    return links
 
-    priorities: List[Dict[str, Any]] = []
 
-    priorities.append({
-        "title": "Map the end-to-end data flow (booking → guest identity → marketing → reporting) and fix integration breakpoints",
-        "why_now": "Integration health is the constraint on automation, attribution confidence, and CRM personalisation.",
-        "what_good_looks_like": [
-            "Single guest identity across booking engine, PMS and ancillary systems (events) where applicable",
-            "Clean booking conversion events into GA4 and reliable channel attribution for direct bookings",
-            "Weekly commercial dashboard fed from source systems (not spreadsheets)",
+_BOOKING_KEYWORDS = [
+    "book", "booking", "reserve", "reservation", "availability", "rooms", "check availability",
+    "offers", "rates",
+]
+
+
+def _find_booking_candidates(base_url: str, soup: BeautifulSoup) -> List[str]:
+    """
+    Finds likely booking URLs from CTA links + forms + iframes.
+    """
+    candidates: List[str] = []
+
+    # Link text + href keyword heuristics
+    for a in soup.find_all("a"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        text = (a.get_text(" ", strip=True) or "").lower()
+        href_l = href.lower()
+        if any(k in text for k in _BOOKING_KEYWORDS) or any(k in href_l for k in _BOOKING_KEYWORDS):
+            candidates.append(urljoin(base_url, href))
+
+    # Form actions
+    for f in soup.find_all("form"):
+        action = (f.get("action") or "").strip()
+        if action:
+            al = action.lower()
+            if any(k in al for k in _BOOKING_KEYWORDS):
+                candidates.append(urljoin(base_url, action))
+
+    # Iframes often embed booking engines
+    for i in soup.find_all("iframe"):
+        src = (i.get("src") or "").strip()
+        if src:
+            sl = src.lower()
+            if any(k in sl for k in _BOOKING_KEYWORDS):
+                candidates.append(urljoin(base_url, src))
+
+    # Deduplicate, preserve order
+    seen = set()
+    out: List[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:6]  # keep bounded
+
+
+async def _safe_get(client: httpx.AsyncClient, url: str) -> Tuple[Optional[PageResult], Optional[Dict[str, Any]]]:
+    """
+    Safe GET: never raises.
+    """
+    try:
+        r = await client.get(url)
+        ct = (r.headers.get("content-type") or "").lower()
+        html = ""
+        if "text/html" in ct or "application/xhtml+xml" in ct or "application/xml" in ct or "text/xml" in ct or "text/plain" in ct:
+            html = r.text or ""
+        cookies = {}
+        try:
+            for k, v in r.cookies.items():
+                if len(cookies) >= MAX_COOKIE_KEYS:
+                    break
+                cookies[str(k)] = str(v)
+        except Exception:
+            pass
+
+        headers = {}
+        try:
+            for hk, hv in r.headers.items():
+                # keep a subset that tends to be useful
+                if hk.lower() in {"server", "x-powered-by", "via", "x-cache", "cf-ray", "x-amz-cf-id"}:
+                    headers[hk] = str(hv)
+        except Exception:
+            pass
+
+        return PageResult(
+            url=str(r.url),
+            status_code=int(r.status_code),
+            content_type=ct,
+            html=html,
+            headers=headers,
+            cookies=cookies,
+        ), None
+    except httpx.TimeoutException:
+        return None, {"type": "timeout", "message": "Upstream request timed out", "url": url}
+    except httpx.RequestError as e:
+        return None, {"type": "request_error", "message": str(e), "url": url}
+    except Exception as e:
+        return None, {"type": "unexpected_error", "message": str(e), "url": url}
+
+
+async def crawl_site_signals(root_url: str) -> Dict[str, Any]:
+    """
+    Bounded crawl from a single URL:
+    - homepage
+    - robots.txt
+    - sitemap.xml
+    - top internal links (depth 1)
+    - booking flow discovery (follow redirects)
+    Returns a structured signals object used for detection + evidence.
+    """
+    root_url = normalise_url(root_url)
+    parsed = urlparse(root_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    pages: List[PageResult] = []
+    errors: List[Dict[str, Any]] = []
+
+    async with httpx.AsyncClient(
+        headers=BROWSER_HEADERS,
+        follow_redirects=True,
+        timeout=CRAWL_TIMEOUT,
+        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+    ) as client:
+        # 1) homepage
+        home, err = await _safe_get(client, root_url)
+        if err:
+            return {"root_url": root_url, "base": base, "pages": [], "errors": [err], "booking_flow": {}, "evidence": {}}
+        if home:
+            pages.append(home)
+
+        # 2) robots + sitemap (best-effort)
+        for p in [urljoin(base, "/robots.txt"), urljoin(base, "/sitemap.xml")]:
+            if len(pages) >= MAX_PAGES:
+                break
+            pr, pe = await _safe_get(client, p)
+            if pe:
+                errors.append(pe)
+            elif pr:
+                pages.append(pr)
+
+        # 3) internal links (depth 1)
+        try:
+            soup = BeautifulSoup(home.html or "", "lxml")
+            internal = _internal_links_from_soup(root_url, soup, MAX_INTERNAL_LINKS)
+        except Exception:
+            internal = []
+
+        for u in internal:
+            if len(pages) >= MAX_PAGES:
+                break
+            pr, pe = await _safe_get(client, u)
+            if pe:
+                errors.append(pe)
+            elif pr:
+                pages.append(pr)
+
+        # 4) booking flow discovery
+        booking_flow = {"candidates": [], "final_url": None, "final_domain": None, "evidence": []}
+        try:
+            soup_home = BeautifulSoup(home.html or "", "lxml")
+            candidates = _find_booking_candidates(root_url, soup_home)
+            booking_flow["candidates"] = candidates
+
+            # Also scan a couple of other pages for booking CTAs
+            for pr in pages[:5]:
+                if len(booking_flow["candidates"]) >= 6:
+                    break
+                if not pr.html:
+                    continue
+                sp = BeautifulSoup(pr.html, "lxml")
+                extra = _find_booking_candidates(pr.url, sp)
+                for c in extra:
+                    if c not in booking_flow["candidates"]:
+                        booking_flow["candidates"].append(c)
+                    if len(booking_flow["candidates"]) >= 6:
+                        break
+
+            # Follow the best candidate (first) to capture final domain and redirect chain
+            if booking_flow["candidates"]:
+                candidate = booking_flow["candidates"][0]
+                try:
+                    # Use GET (not HEAD) because many booking engines block HEAD
+                    r = await client.get(candidate, follow_redirects=True)
+                    booking_flow["final_url"] = str(r.url)
+                    booking_flow["final_domain"] = (urlparse(str(r.url)).netloc or "").lower()
+
+                    chain = []
+                    try:
+                        for h in r.history:
+                            chain.append(str(h.url))
+                    except Exception:
+                        pass
+                    if chain:
+                        booking_flow["evidence"].append({"type": "redirect_chain", "value": chain[:MAX_REDIRECTS]})
+                    booking_flow["evidence"].append({"type": "booking_candidate", "value": candidate})
+                    booking_flow["evidence"].append({"type": "booking_final_url", "value": booking_flow["final_url"]})
+
+                    # Capture cookie keys from the booking response (high signal)
+                    try:
+                        cookie_keys = list(r.cookies.keys())[:MAX_COOKIE_KEYS]
+                        if cookie_keys:
+                            booking_flow["evidence"].append({"type": "booking_cookie_keys", "value": cookie_keys})
+                    except Exception:
+                        pass
+                except Exception:
+                    # If booking flow fails, we still keep candidates
+                    booking_flow["evidence"].append({"type": "booking_flow_error", "value": "Could not follow booking candidate."})
+        except Exception:
+            booking_flow = {"candidates": [], "final_url": None, "final_domain": None, "evidence": [{"type": "booking_flow_error", "value": "Booking discovery failed."}]}
+
+    # Build aggregated evidence + signals
+    asset_urls: List[str] = []
+    asset_domains: List[str] = []
+    headers_union: Dict[str, str] = {}
+    cookie_keys_union: List[str] = []
+    jsonld_union: List[Dict[str, Any]] = []
+
+    combined_text_parts: List[str] = []
+    for pr in pages:
+        if pr.headers:
+            headers_union.update(pr.headers)
+        if pr.cookies:
+            for k in pr.cookies.keys():
+                if k not in cookie_keys_union:
+                    cookie_keys_union.append(k)
+                    if len(cookie_keys_union) >= MAX_COOKIE_KEYS:
+                        break
+
+        html = pr.html or ""
+        if html:
+            combined_text_parts.append(html)
+
+            try:
+                soup = BeautifulSoup(html, "lxml")
+                combined_text_parts.append(soup.get_text(" ", strip=True))
+
+                # assets
+                for tag in soup.find_all(["script", "iframe", "img", "a", "link", "form"]):
+                    for attr in ["src", "href", "action"]:
+                        val = (tag.get(attr) or "").strip()
+                        if not val:
+                            continue
+                        abs_u = urljoin(pr.url, val)
+                        asset_urls.append(abs_u)
+                        host = (urlparse(abs_u).netloc or "").lower()
+                        if host:
+                            asset_domains.append(host)
+
+                # json-ld
+                jsonld_union.extend(_extract_jsonld(soup))
+            except Exception:
+                pass
+
+    # Deduplicate domains
+    asset_domains = sorted(list({d for d in asset_domains if d}))
+    asset_urls = list(dict.fromkeys(asset_urls))  # stable dedupe
+
+    # Evidence register (compact + useful)
+    evidence = {
+        "pages_fetched": [{"url": p.url, "status": p.status_code, "content_type": p.content_type} for p in pages[:MAX_PAGES]],
+        "headers_observed": headers_union,
+        "cookie_keys_observed": cookie_keys_union[:MAX_COOKIE_KEYS],
+        "top_third_party_domains": asset_domains[:40],
+        "booking_flow": booking_flow,
+        "structured_data_snippets": _truncate(str(jsonld_union[:3]), 8000),
+        "crawl_notes": [
+            f"Bounded crawl: max_pages={MAX_PAGES}, max_internal_links={MAX_INTERNAL_LINKS}.",
+            "No authentication, no form submission, no privileged access.",
         ],
-        "exec_questions": [
-            "Where does guest identity fragment today (rooms vs events)?",
-            "Which integrations are manual or brittle, and what fails silently?",
-            "Which KPIs are we trusting that are actually modelled or estimated?",
-        ],
-    })
+        "crawl_errors": errors[:8],
+    }
 
-    if has_gtm:
-        priorities.append({
-            "title": "Turn GTM into full-funnel measurement (GA4 + booking engine events + metasearch hygiene)",
-            "why_now": "You have a tracking foundation, but without clean GA4 and conversion plumbing you cannot steer spend confidently.",
-            "what_good_looks_like": [
-                "GA4 configured with consistent event schema across site + booking engine",
-                "Paid channels receiving correct conversion signals (value and room nights where possible)",
-                "Attribution model documented and governed (stable tag changes)",
-            ],
-            "exec_questions": [
-                "Can we reconcile marketing reporting to actual bookings without debate?",
-                "Do we track abandon/step completion in the booking journey?",
-                "Is metasearch evaluated on incrementality or last-click?",
-            ],
-        })
-    else:
-        priorities.append({
-            "title": "Establish a measurement backbone (GTM + GA4 + conversion plumbing)",
-            "why_now": "Without measurement hygiene, commercial improvements are hard to prove, sustain or scale.",
-            "what_good_looks_like": [
-                "GTM deployed with governance and change control",
-                "GA4 capturing booking-engine events reliably",
-                "Marketing ROI available by channel with confidence",
-            ],
-            "exec_questions": [
-                "What percentage of bookings are unattributed/unknown today?",
-                "Which channel metrics do we not trust (and why)?",
-            ],
-        })
+    combined_blob = " ".join(combined_text_parts)
+    combined_blob = _truncate(combined_blob, MAX_TEXT_CHARS)
 
-    if ("upscale" in segment) or ("luxury" in segment):
-        priorities.append({
-            "title": "Reduce manual revenue decisions: pricing guardrails + demand signals + forecast discipline",
-            "why_now": "Upper-upscale hotels often leak revenue through slow reaction time and inconsistent human override.",
-            "what_good_looks_like": [
-                "Clear pricing rules + exceptions policy and sign-off thresholds",
-                "Forecast cadence tied to events, pace and demand signals",
-                "Segmented strategy (weekday corporate vs weekend/leisure)",
-            ],
-            "exec_questions": [
-                "Where are we overriding recommendations most often, and are we right?",
-                "Do we have a single view of pace, pickup and displacement across segments?",
-            ],
-        })
-    else:
-        priorities.append({
-            "title": "Tighten direct mix economics: channel roles + parity + booking journey conversion tests",
-            "why_now": "Direct mix is often the fastest path to profit; the work is operationally simple but requires discipline.",
-            "what_good_looks_like": [
-                "Defined channel roles (OTA vs metasearch vs brand search)",
-                "Parity monitored and enforced",
-                "Booking journey conversion improved via measurable tests",
-            ],
-            "exec_questions": [
-                "What is our true net cost of acquisition by channel?",
-                "Where do we lose customers in the booking flow?",
-            ],
-        })
-
-    return {"exec_priorities_top3": priorities[:3]}
+    return {
+        "root_url": root_url,
+        "base": base,
+        "pages": pages,
+        "asset_urls": asset_urls,
+        "asset_domains": asset_domains,
+        "headers": headers_union,
+        "cookie_keys": cookie_keys_union[:MAX_COOKIE_KEYS],
+        "booking_flow": booking_flow,
+        "jsonld": jsonld_union,
+        "blob": combined_blob,
+        "evidence": evidence,
+    }
 
 
 # ----------------------------
-# Layer summary builder
+# Layer summary (NO "Unknown": Observed / Inferred / Unresolved)
 # ----------------------------
 def build_layer_summary(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """
+    Always returns each canonical layer with:
+    - visibility_state: Observed / Inferred / Unresolved
+    - detections (observed + customer_confirmed)
+    - likely_state / typical_risk (from inference file)
+    - strategic_importance + rationale
+    """
     summary: Dict[str, Any] = {}
 
     for layer in CANONICAL_LAYER_ORDER:
         dets = by_layer.get(layer, []) or []
         importance, rationale = STRATEGIC_IMPORTANCE.get(layer, ("Medium", ""))
 
+        fallback = LIKELY_STATE_BY_LAYER.get(layer, {})
+
         if dets:
             summary[layer] = {
-                "visibility": "Detected",
+                "visibility": "Observed",
+                "visibility_state": "Observed",
                 "strategic_importance": importance,
                 "importance_rationale": rationale,
                 "detections": dets,
-            }
-        else:
-            fallback = LIKELY_STATE_BY_LAYER.get(layer, {})
-            summary[layer] = {
-                "visibility": "Not publicly visible",
-                "strategic_importance": importance,
-                "importance_rationale": rationale,
-                "detections": [],
                 "likely_state": fallback.get("likely_state"),
                 "typical_risk": fallback.get("typical_risk"),
             }
+        else:
+            # Prefer inference rather than "unknown"
+            likely_state = fallback.get("likely_state")
+            typical_risk = fallback.get("typical_risk")
+
+            if likely_state or typical_risk:
+                summary[layer] = {
+                    "visibility": "Inferred",
+                    "visibility_state": "Inferred",
+                    "strategic_importance": importance,
+                    "importance_rationale": rationale,
+                    "detections": [],
+                    "likely_state": likely_state,
+                    "typical_risk": typical_risk,
+                    "proof_path": _proof_path_for_layer(layer),
+                }
+            else:
+                # Rare: inference library missing this layer
+                summary[layer] = {
+                    "visibility": "Unresolved",
+                    "visibility_state": "Unresolved",
+                    "strategic_importance": importance,
+                    "importance_rationale": rationale,
+                    "detections": [],
+                    "likely_state": "This capability is commonly present in hotels, but cannot be inferred with confidence from current public signals.",
+                    "typical_risk": "Treat as an investigation item; lack of clarity itself creates operational and commercial risk.",
+                    "proof_path": _proof_path_for_layer(layer),
+                }
 
     return summary
 
 
-def choose_segment(url: str) -> str:
-    # Peer benchmark segment used for score interpretation (keep stable)
+def _proof_path_for_layer(layer: str) -> List[str]:
+    """
+    What would prove the stack component from a single URL / public pathway.
+    """
+    layer_l = (layer or "").lower()
+    if "distribution" in layer_l:
+        return [
+            "Follow booking CTA links and capture final redirect domain (booking engine/CRS).",
+            "Inspect iframe src and form actions on booking pages.",
+            "Check cookies set during booking journey (often vendor-specific).",
+        ]
+    if "core" in layer_l:
+        return [
+            "PMS rarely visible publicly; infer via booking engine/CRS patterns and group affiliation.",
+            "Check careers/vendor pages or staff portals linked publicly (occasionally reveal PMS).",
+            "Confirm via reservation confirmation emails or check-in comms (not available from URL).",
+        ]
+    if "guest data" in layer_l or "crm" in layer_l:
+        return [
+            "Inspect newsletter forms and consent tooling (privacy/marketing vendors).",
+            "Look for triggered lifecycle endpoints or email service domains.",
+            "Check site scripts for CRM/CDP tags (Revinate/Cendyn etc.).",
+        ]
+    if "commercial" in layer_l:
+        return [
+            "Inspect scripts for GA4, Meta, Google Ads, metasearch tags.",
+            "Check booking funnel events presence via booking domain signals.",
+        ]
+    if "in-venue" in layer_l:
+        return [
+            "Search site for 'mobile check-in', 'digital key', 'guest app', 'order' pages.",
+            "Look for integrations referenced in FAQ/help pages.",
+        ]
+    if "operations" in layer_l:
+        return [
+            "Ops tools rarely visible publicly; check careers pages for operational tech mentions.",
+            "Check for staff portal links in footer/legal pages.",
+        ]
+    if "finance" in layer_l:
+        return [
+            "BI/reporting not usually visible; infer from group patterns and presence of analytics maturity.",
+            "Look for stakeholder portals, owner/investor pages if any.",
+        ]
+    return ["Review linked pages for vendor mentions and follow booking journey redirects."]
+
+
+# ----------------------------
+# Peer segment selection (stable for benchmarks)
+# ----------------------------
+def choose_peer_segment(url: str) -> str:
     return "lifestyle_boutique"
 
 
-def fallback_response(
-    error: Dict[str, Any],
-    model_inputs: Dict[str, Any],
-    url: Optional[str] = None,
-) -> Dict[str, Any]:
+# ----------------------------
+# Detection against aggregated signals
+# ----------------------------
+def detect_tools_from_signals(signals: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+    """
+    Runs detectors.yaml patterns against combined signal blob + domains + booking flow.
+    """
+    detectors = load_detectors()
+    blob = (signals.get("blob") or "")
+    asset_domains = set(signals.get("asset_domains") or [])
+    asset_urls = set(signals.get("asset_urls") or [])
+    cookie_keys = set(signals.get("cookie_keys") or [])
+    headers = signals.get("headers") or {}
+    booking_final = ((signals.get("booking_flow") or {}).get("final_domain") or "").lower()
+    booking_candidates = (signals.get("booking_flow") or {}).get("candidates") or []
+
+    # Expand searchable space with strong signals
+    searchable_parts = [
+        blob,
+        " ".join(sorted(asset_domains)),
+        " ".join(sorted(asset_urls)),
+        " ".join(sorted(cookie_keys)),
+        " ".join([f"{k}:{v}" for k, v in (headers or {}).items()]),
+        booking_final,
+        " ".join(booking_candidates),
+    ]
+    searchable_blob = _truncate(" ".join([p for p in searchable_parts if p]), MAX_TEXT_CHARS)
+
+    detections: List[Dict[str, Any]] = []
+    by_layer: Dict[str, List[Dict[str, Any]]] = {layer: [] for layer in CANONICAL_LAYER_ORDER}
+
+    for product in detectors:
+        category = product.get("category") or "Unknown"
+        vendor = product.get("vendor") or "Unknown"
+        prod = product.get("product") or "Unknown"
+        patterns = product.get("patterns", [])
+
+        best = 0.0
+        if isinstance(patterns, list):
+            for pattern in patterns:
+                if not isinstance(pattern, dict):
+                    continue
+                ptype = pattern.get("type")
+                value = pattern.get("value")
+                weight = float(pattern.get("weight", 0) or 0)
+
+                if not ptype or not value or weight <= 0:
+                    continue
+
+                v = str(value)
+
+                if ptype == "domain_contains":
+                    if any(v in d for d in asset_domains) or (booking_final and v in booking_final):
+                        best = max(best, weight)
+
+                elif ptype == "text_regex":
+                    if safe_regex(v, searchable_blob):
+                        best = max(best, weight)
+
+                elif ptype == "text_contains":
+                    if v.lower() in searchable_blob.lower():
+                        best = max(best, weight)
+
+                elif ptype == "cookie_contains":
+                    # Optional detector type
+                    if any(v.lower() in ck.lower() for ck in cookie_keys):
+                        best = max(best, weight)
+
+        if best > 0:
+            det = {
+                "vendor": vendor,
+                "product": prod,
+                "category": category,
+                "confidence": round(best, 2),
+                "label": label(best),
+                "source": "public_signal",
+            }
+            detections.append(det)
+
+            layer = map_category_to_layer(category)
+            if layer not in by_layer:
+                layer = "Commercial Execution"
+            by_layer[layer].append(det)
+
+    return detections, by_layer
+
+
+# ----------------------------
+# Comparison (competitor)
+# ----------------------------
+def compute_comparison(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Basic, defensible comparison of two analyses.
+    """
+    try:
+        a_score = (a.get("scores") or {}).get("overall_score_0_to_100")
+        b_score = (b.get("scores") or {}).get("overall_score_0_to_100")
+        delta = None
+        if isinstance(a_score, (int, float)) and isinstance(b_score, (int, float)):
+            delta = round(a_score - b_score, 1)
+
+        def _layer_map(x):
+            out = {}
+            for item in (x.get("scores") or {}).get("layer_scores", []) or []:
+                if isinstance(item, dict):
+                    nm = item.get("layer") or item.get("name")
+                    sc = item.get("score") if item.get("score") is not None else item.get("value")
+                    if nm:
+                        out[str(nm)] = sc
+            return out
+
+        a_layers = _layer_map(a)
+        b_layers = _layer_map(b)
+
+        layer_deltas = []
+        for k in CANONICAL_LAYER_ORDER:
+            if k in a_layers and k in b_layers and isinstance(a_layers[k], (int, float)) and isinstance(b_layers[k], (int, float)):
+                layer_deltas.append({"layer": k, "delta": round(a_layers[k] - b_layers[k], 1)})
+
+        # Evidence delta: booking final domain is highly meaningful
+        a_book = (((a.get("evidence") or {}).get("booking_flow") or {}).get("final_domain"))
+        b_book = (((b.get("evidence") or {}).get("booking_flow") or {}).get("final_domain"))
+
+        return {
+            "score_delta": delta,
+            "layer_deltas": layer_deltas,
+            "booking_engine_domain_a": a_book,
+            "booking_engine_domain_b": b_book,
+            "notes": [
+                "Comparison uses identical public-signal scan logic for both hotels.",
+                "Differences reflect public visibility + booking journey plumbing, not internal quality.",
+            ],
+        }
+    except Exception:
+        return {"error": "comparison_failed", "notes": ["Comparison could not be computed safely."]}
+
+
+# ----------------------------
+# Healthcheck
+# ----------------------------
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# ----------------------------
+# Fallback response
+# ----------------------------
+def fallback_response(error: Dict[str, Any], model_inputs: Dict[str, Any], url: Optional[str] = None) -> Dict[str, Any]:
     """
     Always returns valid JSON. Never raises.
     """
@@ -514,52 +925,44 @@ def fallback_response(
             "error": f"opportunity_model failed: {str(e)}",
         }
 
-    segment = choose_segment(url or "")
-    benchmark = PEER_BENCHMARKS.get(segment, PEER_BENCHMARKS["lifestyle_boutique"])
+    peer_segment = choose_peer_segment(url or "")
+    benchmark = PEER_BENCHMARKS.get(peer_segment, PEER_BENCHMARKS["lifestyle_boutique"])
 
     empty_by_layer = {layer: [] for layer in CANONICAL_LAYER_ORDER}
+    layers = build_layer_summary(empty_by_layer)
 
     analysis = {
         "url": url,
         "detections": [],
         "scores": {"overall_score_0_to_100": None, "layer_scores": []},
         "benchmarks": {
-            "segment": segment,
+            "segment": peer_segment,
             "typical_range": list(benchmark["typical_range"]),
             "best_in_class": benchmark["best_in_class"],
             "interpretation": "Score unavailable due to limited public signals.",
         },
-        "layers": build_layer_summary(empty_by_layer),
-        "segment_inference": {"segment": "Unknown", "confidence": "Low", "evidence": [], "implications": []},
-        "gaps": {"gap_summary": []},
-        "exec_priorities_top3": [],
+        "segment_inference": {"segment": "Unresolved", "confidence": "Low", "evidence": [], "implications": []},
+        "layers": layers,
         "roadmap": ROADMAP,
         "opportunity": opp,
-        "error": error,
+        "evidence": {"crawl_errors": [error]},
         "notes": [
             "Public technology signals could not be processed for this website at this time.",
             "This may be due to bot protection, heavy JavaScript, rate limits, or an internal processing edge case.",
-            "Confirming one internal system (PMS / booking engine / channel manager / CRM) will improve accuracy.",
+            "You can optionally confirm PMS/booking engine/CRM to tighten confidence.",
         ],
+        "error": error,
     }
 
-    report_md = (
-        "# Hotel Technology & Revenue Readiness Report\n\n"
-        "We couldn’t complete the automated scan just now.\n\n"
-        "This does **not** indicate a problem with your systems — it’s often caused by sites restricting automated access "
-        "or by a processing edge case.\n\n"
-        "If you confirm your PMS, booking engine, channel manager or CRM/email platform, I’ll regenerate a full consultant-grade report.\n"
-    )
+    try:
+        report_md = render_report_md(analysis)
+    except Exception:
+        report_md = (
+            "# Hotel Technology & Revenue Readiness Report\n\n"
+            "We couldn’t complete the scan just now. This does not indicate a problem with your systems.\n"
+        )
 
     return {"analysis": analysis, "report_md": report_md}
-
-
-# ----------------------------
-# Healthcheck
-# ----------------------------
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
 
 
 # ----------------------------
@@ -569,114 +972,28 @@ async def health():
 async def analyze(req: AnalyzeRequest):
     """
     Hard guarantee: never throws, never returns 500.
-    Always returns HTTP 200 with an analysis object (and a best-effort report).
+    Always returns HTTP 200 with an analysis object (and best-effort report).
     """
     url = normalise_url(req.url)
+    competitor_url = normalise_url(req.competitor_url) if req.competitor_url else None
     model_inputs = {"rooms": req.rooms, "occupancy": req.occupancy, "adr": req.adr}
 
     try:
-        # 1) Fetch HTML (safe)
-        html, fetch_error = await fetch_html(url)
-        if fetch_error:
-            return fallback_response(fetch_error, model_inputs, url=url)
+        # ---- Run primary scan
+        signals = await crawl_site_signals(url)
+        if not signals.get("pages"):
+            return fallback_response({"type": "crawl_failed", "message": "No pages fetched."}, model_inputs, url=url)
 
-        # 2) Parse HTML (safe)
-        soup = BeautifulSoup(html, "lxml")
-        public_text = soup.get_text(" ", strip=True)
+        # Detect tools using aggregated signals
+        detections, by_layer = detect_tools_from_signals(signals)
 
-        # Collect asset references (absolute and raw), plus domains
-        assets: set[str] = set()
-        asset_domains: set[str] = set()
+        # Inject confirmed systems (customer-provided)
+        inject_confirmed_system(by_layer, detections, req.pms_vendor, "Core Systems", "PMS", "Property Management System")
+        inject_confirmed_system(by_layer, detections, req.booking_engine_vendor, "Distribution", "Booking Engine", "Booking Engine")
+        inject_confirmed_system(by_layer, detections, req.channel_manager_vendor, "Distribution", "Channel Manager", "Channel Manager")
+        inject_confirmed_system(by_layer, detections, req.crm_vendor, "Guest Data & CRM", "CRM", "CRM / Guest Data Platform")
 
-        def _add_asset(val: str):
-            if not val:
-                return
-            v = val.strip()
-            if not v:
-                return
-            assets.add(v)
-            try:
-                abs_v = urljoin(url, v)
-                assets.add(abs_v)
-                host = (urlparse(abs_v).netloc or "").lower()
-                if host:
-                    asset_domains.add(host)
-            except Exception:
-                pass
-
-        for tag in soup.find_all(["script", "iframe", "img", "a", "link", "form"]):
-            _add_asset(tag.get("src") or "")
-            _add_asset(tag.get("href") or "")
-            _add_asset(tag.get("action") or "")
-
-        # 3) Detect tools from public signals (safe)
-        detectors = load_detectors()
-
-        detections: List[Dict[str, Any]] = []
-        by_layer: Dict[str, List[Dict[str, Any]]] = {layer: [] for layer in CANONICAL_LAYER_ORDER}
-
-        searchable_blob = " ".join([
-            html,
-            public_text,
-            " ".join(sorted(assets)),
-            " ".join(sorted(asset_domains)),
-        ])
-
-        for product in detectors:
-            category = product.get("category") or "Unknown"
-            vendor = product.get("vendor") or "Unknown"
-            prod = product.get("product") or "Unknown"
-            patterns = product.get("patterns", [])
-
-            best = 0.0
-            if isinstance(patterns, list):
-                for pattern in patterns:
-                    if not isinstance(pattern, dict):
-                        continue
-                    ptype = pattern.get("type")
-                    value = pattern.get("value")
-                    weight = float(pattern.get("weight", 0) or 0)
-
-                    if not ptype or not value or weight <= 0:
-                        continue
-
-                    v = str(value)
-
-                    if ptype == "domain_contains":
-                        if any(v in a for a in assets) or any(v in d for d in asset_domains):
-                            best = max(best, weight)
-
-                    elif ptype == "text_regex":
-                        if safe_regex(v, searchable_blob):
-                            best = max(best, weight)
-
-                    elif ptype == "text_contains":
-                        if v.lower() in searchable_blob.lower():
-                            best = max(best, weight)
-
-            if best > 0:
-                det = {
-                    "vendor": vendor,
-                    "product": prod,
-                    "category": category,
-                    "confidence": round(best, 2),
-                    "label": label(best),
-                    "source": "public_signal",
-                }
-                detections.append(det)
-
-                layer = map_category_to_layer(category)
-                if layer not in by_layer:
-                    layer = "Commercial Execution"
-                by_layer[layer].append(det)
-
-        # 3b) Inject optional customer-confirmed systems (best way to reduce unknowns for PMS/CRM)
-        inject_confirmed_system(by_layer, req.pms_vendor, "Core Systems", "PMS", "Property Management System")
-        inject_confirmed_system(by_layer, req.booking_engine_vendor, "Distribution", "Booking Engine", "Booking Engine")
-        inject_confirmed_system(by_layer, req.channel_manager_vendor, "Distribution", "Channel Manager", "Channel Manager")
-        inject_confirmed_system(by_layer, req.crm_vendor, "Guest Data & CRM", "CRM", "CRM / Guest Data Platform")
-
-        # 4) Score + opportunity (safe)
+        # Score (safe)
         try:
             scores = score_layers(by_layer)
         except Exception as e:
@@ -687,6 +1004,7 @@ async def analyze(req: AnalyzeRequest):
                 "error": f"score_layers failed: {str(e)}",
             }
 
+        # Opportunity (safe)
         try:
             opp = opportunity_model(model_inputs)
         except Exception as e:
@@ -697,20 +1015,23 @@ async def analyze(req: AnalyzeRequest):
                 "error": f"opportunity_model failed: {str(e)}",
             }
 
-        # 5) Benchmarks + interpretation
-        peer_segment = choose_segment(url)
+        # Benchmarks + interpretation
+        peer_segment = choose_peer_segment(url)
         benchmark = PEER_BENCHMARKS.get(peer_segment, PEER_BENCHMARKS["lifestyle_boutique"])
         score_text = interpret_score(scores.get("overall_score_0_to_100"), benchmark)
 
-        # 6) Layer summaries
+        # Layers (Observed/Inferred/Unresolved)
         layers = build_layer_summary(by_layer)
 
-        # 7) MD-grade enhancers
-        segment_inference = infer_hotel_segment(public_text=public_text, url=url)
-        gaps = classify_visibility_vs_capability(by_layer=by_layer, segment_inference=segment_inference)
-        exec_priorities = build_exec_priorities(segment_inference=segment_inference, by_layer=by_layer)
+        # Segment inference (from aggregated public text)
+        # Reuse the blob; pull a smaller sample for segment to avoid noise
+        try:
+            sample_text = signals.get("blob") or ""
+            sample_text = sample_text[:80_000]
+        except Exception:
+            sample_text = ""
+        segment_inference = infer_hotel_segment(public_text=sample_text, url=url)
 
-        # Determine confirmation status for narrative
         confirmations = {
             "pms_vendor": req.pms_vendor,
             "booking_engine_vendor": req.booking_engine_vendor,
@@ -730,23 +1051,58 @@ async def analyze(req: AnalyzeRequest):
                 "interpretation": score_text,
             },
             "segment_inference": segment_inference,
-            "gaps": gaps,
-            "exec_priorities_top3": exec_priorities.get("exec_priorities_top3", []),
             "layers": layers,
             "roadmap": ROADMAP,
             "opportunity": opp,
+            "evidence": signals.get("evidence") or {},
             "confirmations": {
                 "provided": confirmations_provided,
-                "note": "Confirmed systems are treated as 'confirmed' detections with source='customer_confirmed'.",
+                "note": "Confirmed systems are treated as confirmed detections with source='customer_confirmed'.",
             },
             "notes": [
-                "Some hotel systems are not publicly visible and may require confirmation.",
-                "Confidence labels reflect public signal strength only (not internal usage quality).",
-                "This assessment is vendor-neutral and uses public web signals + benchmarks.",
+                "This assessment uses bounded public-signal crawling (homepage + internal links + booking flow where discoverable).",
+                "Visibility states are Observed/Inferred/Unresolved; lack of observation does not imply absence.",
+                "Vendor-neutral by design; examples are illustrative, not recommendations.",
             ],
         }
 
-        # 8) Render report (safe)
+        # ---- Competitor scan + comparison (optional)
+        if competitor_url:
+            try:
+                comp_signals = await crawl_site_signals(competitor_url)
+                comp_dets, comp_by_layer = detect_tools_from_signals(comp_signals)
+                comp_layers = build_layer_summary(comp_by_layer)
+
+                try:
+                    comp_scores = score_layers(comp_by_layer)
+                except Exception:
+                    comp_scores = {"overall_score_0_to_100": None, "layer_scores": [], "error": "score_layers_failed"}
+
+                comp_peer_segment = choose_peer_segment(competitor_url)
+                comp_benchmark = PEER_BENCHMARKS.get(comp_peer_segment, PEER_BENCHMARKS["lifestyle_boutique"])
+                comp_score_text = interpret_score(comp_scores.get("overall_score_0_to_100"), comp_benchmark)
+
+                competitor_analysis = {
+                    "url": competitor_url,
+                    "detections": comp_dets,
+                    "scores": comp_scores,
+                    "benchmarks": {
+                        "segment": comp_peer_segment,
+                        "typical_range": list(comp_benchmark["typical_range"]),
+                        "best_in_class": comp_benchmark["best_in_class"],
+                        "interpretation": comp_score_text,
+                    },
+                    "layers": comp_layers,
+                    "evidence": comp_signals.get("evidence") or {},
+                }
+
+                analysis["competitor"] = competitor_analysis
+                analysis["comparison"] = compute_comparison(analysis, competitor_analysis)
+            except Exception:
+                logger.error("Competitor scan failed:\n%s", traceback.format_exc())
+                analysis["comparison"] = {"error": "competitor_scan_failed", "notes": ["Competitor scan could not be completed safely."]}
+
+        # Render report (safe)
         try:
             report_md = render_report_md(analysis)
         except TypeError:
