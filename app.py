@@ -3,7 +3,6 @@ import traceback
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
 
@@ -16,7 +15,7 @@ from pydantic import BaseModel, Field
 from scoring import score_layers
 from report import opportunity_model, render_report_md
 
-# Step 1.3+: Benchmarks + interpretation + likely-state + MD weighting + roadmap
+# Benchmarks + interpretation + likely-state + weighting + roadmap
 from benchmarks import PEER_BENCHMARKS
 from interpretation import interpret_score
 from inference import LIKELY_STATE_BY_LAYER
@@ -29,16 +28,24 @@ from roadmap import ROADMAP
 logger = logging.getLogger("hotel_tech_readiness")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Hotel Tech Readiness API", version="0.2.0")
+app = FastAPI(title="Hotel Tech Readiness API", version="0.3.0")
 
 # ----------------------------
 # OpenAPI Models (important for GPT Actions)
 # ----------------------------
 class AnalyzeRequest(BaseModel):
     url: str
+
+    # Commercial assumptions (optional)
     rooms: int | None = None
     occupancy: float | None = None
     adr: float | None = None
+
+    # Optional customer-confirmed systems (trust-first, removes "Unknown" where PMS/CRM is private)
+    pms_vendor: str | None = None
+    booking_engine_vendor: str | None = None
+    channel_manager_vendor: str | None = None
+    crm_vendor: str | None = None
 
 
 class AnalyzeResponse(BaseModel):
@@ -136,7 +143,6 @@ def load_detectors() -> List[Dict[str, Any]]:
         products = data.get("products", [])
         if not isinstance(products, list):
             return []
-        # Keep only dict items
         return [p for p in products if isinstance(p, dict)]
     except Exception:
         logger.error("ERROR loading detectors.yaml:\n%s", traceback.format_exc())
@@ -144,8 +150,7 @@ def load_detectors() -> List[Dict[str, Any]]:
 
 
 # ----------------------------
-# Layer mapping
-# (lets your detectors.yaml use flexible categories while keeping a consistent report structure)
+# Layer mapping (detectors.yaml categories -> canonical report layers)
 # ----------------------------
 CANONICAL_LAYER_ORDER = [
     "Distribution",
@@ -157,7 +162,6 @@ CANONICAL_LAYER_ORDER = [
     "Finance & Reporting",
 ]
 
-# Common synonyms / detector categories -> canonical report layers
 CATEGORY_TO_LAYER = {
     # Distribution
     "distribution": "Distribution",
@@ -169,7 +173,7 @@ CATEGORY_TO_LAYER = {
     "booking engine": "Distribution",
     "booking_engine": "Distribution",
 
-    # Core Systems
+    # Core systems
     "pms": "Core Systems",
     "rms": "Core Systems",
     "property management": "Core Systems",
@@ -183,7 +187,7 @@ CATEGORY_TO_LAYER = {
     "guest data": "Guest Data & CRM",
     "loyalty": "Guest Data & CRM",
 
-    # Commercial execution / tracking
+    # Tracking & attribution
     "tracking": "Commercial Execution",
     "analytics": "Commercial Execution",
     "attribution": "Commercial Execution",
@@ -191,7 +195,7 @@ CATEGORY_TO_LAYER = {
     "advertising": "Commercial Execution",
     "commercial execution": "Commercial Execution",
 
-    # In-venue experience
+    # In-venue
     "in-venue": "In-Venue Experience",
     "in venue": "In-Venue Experience",
     "guest messaging": "In-Venue Experience",
@@ -215,16 +219,47 @@ CATEGORY_TO_LAYER = {
     "finance & reporting": "Finance & Reporting",
 }
 
+
 def map_category_to_layer(category: str) -> str:
     c = (category or "").strip().lower()
     if not c:
-        return "Commercial Execution"  # safest default for unknown web signals
-    return CATEGORY_TO_LAYER.get(c, category) if category in CANONICAL_LAYER_ORDER else CATEGORY_TO_LAYER.get(c, "Commercial Execution")
+        return "Commercial Execution"
+    if category in CANONICAL_LAYER_ORDER:
+        return category
+    return CATEGORY_TO_LAYER.get(c, "Commercial Execution")
 
 
 # ----------------------------
-# MD-grade report enhancers (segment inference + gap classification + exec priorities)
-# Self-contained so you can copy/paste app.py alone.
+# Customer-confirmed injection (reduces Unknowns honestly)
+# ----------------------------
+def inject_confirmed_system(
+    by_layer: Dict[str, List[Dict[str, Any]]],
+    vendor: Optional[str],
+    layer: str,
+    category: str,
+    product: str,
+):
+    """
+    Treat user-confirmed systems as high-confidence detections.
+    """
+    if not vendor:
+        return
+
+    det = {
+        "vendor": vendor,
+        "product": product,
+        "category": category,
+        "confidence": 0.99,
+        "label": "confirmed",
+        "source": "customer_confirmed",
+    }
+    if layer not in by_layer:
+        by_layer[layer] = []
+    by_layer[layer].append(det)
+
+
+# ----------------------------
+# MD-grade report enhancers
 # ----------------------------
 @dataclass
 class SegmentInference:
@@ -239,9 +274,10 @@ _LUXURY_CUES = [
     "suite", "heritage", "historic", "fine dining", "champagne",
 ]
 _DESTINATION_CUES = [
-    "york", "cathedral", "city centre", "city center", "landmark",
+    "york", "leeds", "cathedral", "city centre", "city center", "landmark",
     "rail", "station", "minutes from", "walk to",
 ]
+
 
 def infer_hotel_segment(public_text: str, url: str = "") -> Dict[str, Any]:
     """
@@ -257,21 +293,21 @@ def infer_hotel_segment(public_text: str, url: str = "") -> Dict[str, Any]:
     if luxury_hits:
         evidence.append(f"Luxury cues: {', '.join(sorted(set(luxury_hits))[:6])}")
     if dest_hits:
-        evidence.append(f"Destination cues: {', '.join(sorted(set(dest_hits))[:6])}")
+        evidence.append(f"Destination/urban cues: {', '.join(sorted(set(dest_hits))[:6])}")
 
     if luxury_hits and dest_hits:
-        segment = "Luxury destination hotel"
+        segment = "Upper-upscale / luxury city hotel"
         confidence = "Medium"
         implications = [
-            "Likely multiple revenue centres (rooms + F&B + spa + events) → guest data fragmentation risk is high.",
-            "Attribution and channel mix typically more complex → booking-engine conversion plumbing is a common leak.",
-            "Integration health matters more than tool count → prioritise data flow mapping before vendor changes.",
+            "Likely multiple revenue centres (rooms + F&B + events) → guest data fragmentation risk is high.",
+            "Attribution and channel mix are typically complex → booking-engine conversion plumbing is a common leak.",
+            "Integration health matters more than tool count → map data flow before changing vendors.",
         ]
     elif luxury_hits:
-        segment = "Luxury independent hotel"
+        segment = "Upper-upscale independent hotel"
         confidence = "Low–Medium"
         implications = [
-            "Premium positioning → direct mix and repeat behaviour are high-leverage commercial levers.",
+            "Premium positioning → direct mix and repeat behaviour are high-leverage levers.",
             "CRM orchestration and identity resolution are often under-utilised.",
             "Integration health is usually the maturity constraint, not vendor choice.",
         ]
@@ -285,24 +321,22 @@ def infer_hotel_segment(public_text: str, url: str = "") -> Dict[str, Any]:
     if not evidence:
         evidence = ["No strong segment cues detected in sampled public text."]
 
-    return {
-        "segment": segment,
-        "confidence": confidence,
-        "evidence": evidence,
-        "implications": implications,
-    }
+    return {"segment": segment, "confidence": confidence, "evidence": evidence, "implications": implications}
 
-def classify_visibility_vs_capability(by_layer: Dict[str, List[Dict[str, Any]]], segment_inference: Dict[str, Any]) -> Dict[str, Any]:
+
+def classify_visibility_vs_capability(
+    by_layer: Dict[str, List[Dict[str, Any]]],
+    segment_inference: Dict[str, Any],
+) -> Dict[str, Any]:
     """
-    Turns 'Unknown' into an MD-useful stance:
-    - Visibility gap: likely exists internally but isn't publicly observable
-    - Potential capability gap: uncertain (not universally present)
+    Converts "Unknown" into a useful MD stance:
+    - Visibility gap: likely present but not observable publicly
+    - Potential capability gap: uncertain / not universally present
     """
     seg = (segment_inference or {}).get("segment", "").lower()
 
     def likely_exists(layer_name: str) -> bool:
-        # Core systems almost certainly exist, especially for luxury/destination properties.
-        if "luxury" in seg:
+        if "upscale" in seg or "luxury" in seg:
             return layer_name in {"Distribution", "Core Systems", "Operations", "Finance & Reporting"}
         return layer_name in {"Distribution", "Core Systems", "Finance & Reporting"}
 
@@ -317,40 +351,50 @@ def classify_visibility_vs_capability(by_layer: Dict[str, List[Dict[str, Any]]],
         else:
             if likely_exists(layer):
                 gap_type = "Visibility gap (likely present but not observable)"
-                rationale = "Hotels of this type almost always operate these systems; lack of web signals suggests hidden integrations or vendor opacity."
+                rationale = "Hotels of this type almost always operate these systems; lack of web signals suggests vendor opacity or hidden integrations."
             else:
                 gap_type = "Potential capability gap (uncertain)"
-                rationale = "Insufficient public evidence and not universally present in comparable hotels; treat as an investigation priority."
+                rationale = "Insufficient public evidence and not universally present; treat as an investigation priority."
 
         out.append({"layer": layer, "gap_type": gap_type, "rationale": rationale})
+
     return {"gap_summary": out}
 
-def build_exec_priorities(segment_inference: Dict[str, Any], by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+
+def build_exec_priorities(
+    segment_inference: Dict[str, Any],
+    by_layer: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
     """
-    Opinionated 'Top 3' executive priorities based on segment + tracking foundation.
+    Opinionated 'Top 3' executive priorities.
     """
     segment = (segment_inference or {}).get("segment", "").lower()
     commercial_tools = by_layer.get("Commercial Execution", []) or []
-    has_gtm = any(
-        ("google tag manager" in (d.get("product", "") or "").lower())
-        or ("google tag manager" in (d.get("vendor", "") or "").lower())
-        for d in commercial_tools
-        if isinstance(d, dict) and d.get("label") == "confirmed"
-    )
+
+    def _is_confirmed_gtm(d: Dict[str, Any]) -> bool:
+        if not isinstance(d, dict):
+            return False
+        if d.get("label") != "confirmed":
+            return False
+        p = (d.get("product") or "").lower()
+        v = (d.get("vendor") or "").lower()
+        return ("google tag manager" in p) or ("google tag manager" in v)
+
+    has_gtm = any(_is_confirmed_gtm(d) for d in commercial_tools)
 
     priorities: List[Dict[str, Any]] = []
 
     priorities.append({
         "title": "Map the end-to-end data flow (booking → guest identity → marketing → reporting) and fix integration breakpoints",
-        "why_now": "Integration health is the main constraint on automation, attribution accuracy, and CRM personalisation.",
+        "why_now": "Integration health is the constraint on automation, attribution confidence, and CRM personalisation.",
         "what_good_looks_like": [
-            "Single guest identity across booking engine, PMS, and ancillary systems (spa/events) where applicable",
+            "Single guest identity across booking engine, PMS and ancillary systems (events) where applicable",
             "Clean booking conversion events into GA4 and reliable channel attribution for direct bookings",
             "Weekly commercial dashboard fed from source systems (not spreadsheets)",
         ],
         "exec_questions": [
-            "Where does guest identity fragment today (rooms vs spa vs events)?",
-            "Which integrations are brittle/manual, and what fails silently?",
+            "Where does guest identity fragment today (rooms vs events)?",
+            "Which integrations are manual or brittle, and what fails silently?",
             "Which KPIs are we trusting that are actually modelled or estimated?",
         ],
     })
@@ -358,7 +402,7 @@ def build_exec_priorities(segment_inference: Dict[str, Any], by_layer: Dict[str,
     if has_gtm:
         priorities.append({
             "title": "Turn GTM into full-funnel measurement (GA4 + booking engine events + metasearch hygiene)",
-            "why_now": "You have a tracking foundation (GTM) but without clean GA4 and conversion plumbing you cannot steer spend confidently.",
+            "why_now": "You have a tracking foundation, but without clean GA4 and conversion plumbing you cannot steer spend confidently.",
             "what_good_looks_like": [
                 "GA4 configured with consistent event schema across site + booking engine",
                 "Paid channels receiving correct conversion signals (value and room nights where possible)",
@@ -367,13 +411,13 @@ def build_exec_priorities(segment_inference: Dict[str, Any], by_layer: Dict[str,
             "exec_questions": [
                 "Can we reconcile marketing reporting to actual bookings without debate?",
                 "Do we track abandon/step completion in the booking journey?",
-                "Is metasearch measured on incrementality or last-click?",
+                "Is metasearch evaluated on incrementality or last-click?",
             ],
         })
     else:
         priorities.append({
             "title": "Establish a measurement backbone (GTM + GA4 + conversion plumbing)",
-            "why_now": "Without measurement hygiene, commercial improvements are hard to prove, sustain, or scale.",
+            "why_now": "Without measurement hygiene, commercial improvements are hard to prove, sustain or scale.",
             "what_good_looks_like": [
                 "GTM deployed with governance and change control",
                 "GA4 capturing booking-engine events reliably",
@@ -385,18 +429,18 @@ def build_exec_priorities(segment_inference: Dict[str, Any], by_layer: Dict[str,
             ],
         })
 
-    if "luxury" in segment:
+    if ("upscale" in segment) or ("luxury" in segment):
         priorities.append({
             "title": "Reduce manual revenue decisions: pricing guardrails + demand signals + forecast discipline",
-            "why_now": "Luxury/destination hotels often leak revenue through slow reaction time and inconsistent human override.",
+            "why_now": "Upper-upscale hotels often leak revenue through slow reaction time and inconsistent human override.",
             "what_good_looks_like": [
                 "Clear pricing rules + exceptions policy and sign-off thresholds",
-                "Forecast cadence tied to events/pace and demand signals",
-                "Documented strategy by segment (weekday corporate vs weekend/leisure peaks)",
+                "Forecast cadence tied to events, pace and demand signals",
+                "Segmented strategy (weekday corporate vs weekend/leisure)",
             ],
             "exec_questions": [
                 "Where are we overriding recommendations most often, and are we right?",
-                "Do we have a single view of pace, pickup, and displacement across segments?",
+                "Do we have a single view of pace, pickup and displacement across segments?",
             ],
         })
     else:
@@ -421,14 +465,8 @@ def build_exec_priorities(segment_inference: Dict[str, Any], by_layer: Dict[str,
 # Layer summary builder
 # ----------------------------
 def build_layer_summary(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
-    """
-    Converts detections-by-layer into an MD-friendly layer summary:
-    - visibility: Detected / Not publicly visible
-    - detections: list
-    - likely_state + typical_risk when not visible
-    - strategic_importance + rationale always
-    """
     summary: Dict[str, Any] = {}
+
     for layer in CANONICAL_LAYER_ORDER:
         dets = by_layer.get(layer, []) or []
         importance, rationale = STRATEGIC_IMPORTANCE.get(layer, ("Medium", ""))
@@ -455,14 +493,15 @@ def build_layer_summary(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, 
 
 
 def choose_segment(url: str) -> str:
-    """
-    Baseline peer benchmark segment used for score interpretation.
-    Keep simple and stable; segment inference is also provided separately for narrative quality.
-    """
+    # Peer benchmark segment used for score interpretation (keep stable)
     return "lifestyle_boutique"
 
 
-def fallback_response(error: Dict[str, Any], model_inputs: Dict[str, Any], url: Optional[str] = None) -> Dict[str, Any]:
+def fallback_response(
+    error: Dict[str, Any],
+    model_inputs: Dict[str, Any],
+    url: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Always returns valid JSON. Never raises.
     """
@@ -479,6 +518,7 @@ def fallback_response(error: Dict[str, Any], model_inputs: Dict[str, Any], url: 
     benchmark = PEER_BENCHMARKS.get(segment, PEER_BENCHMARKS["lifestyle_boutique"])
 
     empty_by_layer = {layer: [] for layer in CANONICAL_LAYER_ORDER}
+
     analysis = {
         "url": url,
         "detections": [],
@@ -490,6 +530,9 @@ def fallback_response(error: Dict[str, Any], model_inputs: Dict[str, Any], url: 
             "interpretation": "Score unavailable due to limited public signals.",
         },
         "layers": build_layer_summary(empty_by_layer),
+        "segment_inference": {"segment": "Unknown", "confidence": "Low", "evidence": [], "implications": []},
+        "gaps": {"gap_summary": []},
+        "exec_priorities_top3": [],
         "roadmap": ROADMAP,
         "opportunity": opp,
         "error": error,
@@ -529,7 +572,6 @@ async def analyze(req: AnalyzeRequest):
     Always returns HTTP 200 with an analysis object (and a best-effort report).
     """
     url = normalise_url(req.url)
-
     model_inputs = {"rooms": req.rooms, "occupancy": req.occupancy, "adr": req.adr}
 
     try:
@@ -567,14 +609,18 @@ async def analyze(req: AnalyzeRequest):
             _add_asset(tag.get("href") or "")
             _add_asset(tag.get("action") or "")
 
-        # 3) Detect tools (safe)
+        # 3) Detect tools from public signals (safe)
         detectors = load_detectors()
 
         detections: List[Dict[str, Any]] = []
         by_layer: Dict[str, List[Dict[str, Any]]] = {layer: [] for layer in CANONICAL_LAYER_ORDER}
 
-        # Include additional searchable strings to improve detection without JS execution
-        searchable_blob = " ".join([html, public_text, " ".join(sorted(assets)), " ".join(sorted(asset_domains))])
+        searchable_blob = " ".join([
+            html,
+            public_text,
+            " ".join(sorted(assets)),
+            " ".join(sorted(asset_domains)),
+        ])
 
         for product in detectors:
             category = product.get("category") or "Unknown"
@@ -597,12 +643,10 @@ async def analyze(req: AnalyzeRequest):
                     v = str(value)
 
                     if ptype == "domain_contains":
-                        # matches in asset URLs or domains
                         if any(v in a for a in assets) or any(v in d for d in asset_domains):
                             best = max(best, weight)
 
                     elif ptype == "text_regex":
-                        # search across combined blob (html + visible text + assets)
                         if safe_regex(v, searchable_blob):
                             best = max(best, weight)
 
@@ -617,14 +661,20 @@ async def analyze(req: AnalyzeRequest):
                     "category": category,
                     "confidence": round(best, 2),
                     "label": label(best),
+                    "source": "public_signal",
                 }
                 detections.append(det)
 
                 layer = map_category_to_layer(category)
                 if layer not in by_layer:
-                    # Keep it safe: unknown categories go to Commercial Execution
                     layer = "Commercial Execution"
                 by_layer[layer].append(det)
+
+        # 3b) Inject optional customer-confirmed systems (best way to reduce unknowns for PMS/CRM)
+        inject_confirmed_system(by_layer, req.pms_vendor, "Core Systems", "PMS", "Property Management System")
+        inject_confirmed_system(by_layer, req.booking_engine_vendor, "Distribution", "Booking Engine", "Booking Engine")
+        inject_confirmed_system(by_layer, req.channel_manager_vendor, "Distribution", "Channel Manager", "Channel Manager")
+        inject_confirmed_system(by_layer, req.crm_vendor, "Guest Data & CRM", "CRM", "CRM / Guest Data Platform")
 
         # 4) Score + opportunity (safe)
         try:
@@ -647,18 +697,27 @@ async def analyze(req: AnalyzeRequest):
                 "error": f"opportunity_model failed: {str(e)}",
             }
 
-        # 5) Benchmarks + interpretation (peer segment for scoring context)
+        # 5) Benchmarks + interpretation
         peer_segment = choose_segment(url)
         benchmark = PEER_BENCHMARKS.get(peer_segment, PEER_BENCHMARKS["lifestyle_boutique"])
         score_text = interpret_score(scores.get("overall_score_0_to_100"), benchmark)
 
-        # 6) Layer summaries (likely-state + strategic importance)
+        # 6) Layer summaries
         layers = build_layer_summary(by_layer)
 
         # 7) MD-grade enhancers
         segment_inference = infer_hotel_segment(public_text=public_text, url=url)
         gaps = classify_visibility_vs_capability(by_layer=by_layer, segment_inference=segment_inference)
         exec_priorities = build_exec_priorities(segment_inference=segment_inference, by_layer=by_layer)
+
+        # Determine confirmation status for narrative
+        confirmations = {
+            "pms_vendor": req.pms_vendor,
+            "booking_engine_vendor": req.booking_engine_vendor,
+            "channel_manager_vendor": req.channel_manager_vendor,
+            "crm_vendor": req.crm_vendor,
+        }
+        confirmations_provided = {k: v for k, v in confirmations.items() if v}
 
         analysis: Dict[str, Any] = {
             "url": url,
@@ -676,6 +735,10 @@ async def analyze(req: AnalyzeRequest):
             "layers": layers,
             "roadmap": ROADMAP,
             "opportunity": opp,
+            "confirmations": {
+                "provided": confirmations_provided,
+                "note": "Confirmed systems are treated as 'confirmed' detections with source='customer_confirmed'.",
+            },
             "notes": [
                 "Some hotel systems are not publicly visible and may require confirmation.",
                 "Confidence labels reflect public signal strength only (not internal usage quality).",
@@ -687,7 +750,6 @@ async def analyze(req: AnalyzeRequest):
         try:
             report_md = render_report_md(analysis)
         except TypeError:
-            # Backwards compatible: old renderer expects only scores/opportunity
             report_md = render_report_md({"scores": scores, "opportunity": opp})
         except Exception as e:
             logger.error("ERROR in render_report_md:\n%s", traceback.format_exc())
