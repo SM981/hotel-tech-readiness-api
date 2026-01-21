@@ -1,103 +1,90 @@
-# priorities.py
-from typing import Dict, Any, List
+from __future__ import annotations
+
+from typing import Any, Dict, List
 
 
-def build_exec_priorities(analysis: Dict[str, Any]) -> Dict[str, Any]:
+OWNER_ROLE_MAP = {
+    "revenue": "Commercial / Revenue Director",
+    "marketing": "Marketing Director",
+    "operations": "Operations Director",
+    "finance": "Finance Director",
+    "leadership": "GM / CEO",
+    "it": "IT Lead",
+}
+
+
+def _severity(gap: Dict[str, Any]) -> int:
     """
-    Produces opinionated 'Top 3' priorities based on:
-    - segment inference
-    - visibility/capability gap types
-    - presence of tracking foundation (e.g., GTM)
+    Deterministic severity based on:
+    - decision impaired presence (always required)
+    - risk wording length/clarity (proxy, not sentiment)
+    Kept intentionally simple and transparent.
     """
-    segment = ((analysis or {}).get("segment_inference") or {}).get("segment", "").lower()
-    gaps = ((analysis or {}).get("gaps") or {}).get("gap_summary", []) or []
+    score = 50
+    if gap.get("trigger") in {"system_missing", "integration_not_active"}:
+        score += 20
+    if "cannot" in (gap.get("decision_impaired", "").lower()):
+        score += 10
+    if "risk" in (gap.get("risk_if_unchanged", "").lower()):
+        score += 5
+    return min(100, score)
 
-    gap_by_layer = {g.get("layer"): g for g in gaps if isinstance(g, dict)}
-    has_gtm = False
-    detected = (analysis or {}).get("detection", {}) or {}
-    tracking_layer = detected.get("tracking_attribution", {}) or {}
-    tools = tracking_layer.get("tools_detected", []) or []
-    for t in tools:
-        if isinstance(t, dict) and (t.get("name", "") or "").lower() == "google tag manager" and t.get("confidence") == "confirmed":
-            has_gtm = True
 
-    priorities: List[Dict[str, Any]] = []
+def build_next_steps(gaps: List[Dict[str, Any]], recommendations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # Sort gaps by severity, highest first
+    ranked = sorted(gaps, key=_severity, reverse=True)
 
-    # Priority 1: Data flow + integration health
-    priorities.append({
-        "title": "Map the end-to-end data flow (rooms → guest identity → marketing → reporting) and fix integration breakpoints",
-        "why_now": "Integration health is the main constraint on automation, attribution accuracy, and CRM personalisation.",
-        "what_good_looks_like": [
-            "Single guest identity across booking engine, PMS, spa/events (where applicable), and marketing systems",
-            "Clean conversion events into GA4 and accurate channel attribution for direct bookings",
-            "Daily/weekly commercial dashboard fed from source systems (not spreadsheets)"
-        ],
-        "exec_questions": [
-            "Where does guest identity fragment today (rooms vs spa vs events)?",
-            "Which integrations are brittle/manual, and what fails silently?",
-            "What metrics are we trusting that are actually modelled or estimated?"
-        ]
-    })
+    actions_0_30: List[Dict[str, Any]] = []
+    actions_31_60: List[Dict[str, Any]] = []
+    actions_61_90: List[Dict[str, Any]] = []
 
-    # Priority 2: Tracking hygiene (if GTM present, lean into it)
-    if has_gtm:
-        priorities.append({
-            "title": "Turn GTM into true full-funnel measurement (GA4 + booking engine events + metasearch hygiene)",
-            "why_now": "You have the foundation (GTM) but without clean GA4 and conversion plumbing you cannot steer spend confidently.",
-            "what_good_looks_like": [
-                "GA4 configured with consistent event schema across site + booking engine",
-                "Meta + paid channels receiving correct conversion signals (value + room nights if possible)",
-                "Attribution model documented and stable (no constant tag churn)"
-            ],
-            "exec_questions": [
-                "Can we reconcile marketing reporting to actual bookings without debate?",
-                "Do we track abandon, step completion, and failure points in the booking journey?",
-                "Is metasearch measured on incrementality or just last-click?"
-            ]
-        })
-    else:
-        priorities.append({
-            "title": "Establish a measurement backbone (GTM + GA4 + conversion plumbing)",
-            "why_now": "Without a measurement backbone, improvements in pricing and distribution will be hard to prove and sustain.",
-            "what_good_looks_like": [
-                "GTM deployed with governance and change control",
-                "GA4 capturing booking-engine events reliably",
-                "Marketing ROI available by channel with confidence"
-            ],
-            "exec_questions": [
-                "What percentage of bookings are unattributed/unknown today?",
-                "Which channel metrics do we not trust (and why)?"
-            ]
-        })
+    for g in ranked:
+        owner_fn = g.get("owner_function", "leadership")
+        owner_role = OWNER_ROLE_MAP.get(owner_fn, "GM / CEO")
 
-    # Priority 3: Revenue automation (segment-driven)
-    if "luxury" in segment:
-        priorities.append({
-            "title": "Reduce manual revenue decisions: pricing guardrails + demand signals + forecast discipline",
-            "why_now": "Luxury/destination hotels leak revenue through slow reaction time and human override; guardrails create consistency.",
-            "what_good_looks_like": [
-                "Clear pricing rules + exceptions policy",
-                "Forecast cadence tied to events/pace and demand signals",
-                "Documented strategy by segment (weekday corporate vs leisure peaks)"
-            ],
-            "exec_questions": [
-                "Where are we overriding recommendations most often, and are we right?",
-                "Do we have a single view of pace, pickup, and displacement across segments?"
-            ]
-        })
-    else:
-        priorities.append({
-            "title": "Tighten direct mix economics: channel strategy + parity + conversion optimisation",
-            "why_now": "Direct mix is the fastest path to profit; the work is usually operationally simple but requires discipline.",
-            "what_good_looks_like": [
-                "Defined channel roles (OTA vs metasearch vs brand search)",
-                "Parity monitored and enforced",
-                "Booking journey conversion improved with measurable tests"
-            ],
-            "exec_questions": [
-                "What is our true net cost of acquisition by channel?",
-                "Where do we lose customers in the booking flow?"
-            ]
-        })
+        # Convert each gap into actions that close uncertainty first, then enable, then consider buying.
+        base_action = {
+            "action": g["close_gap_action"],
+            "owner_role": owner_role,
+            "dependency": "Stakeholder confirmation",
+            "outcome": "Gap is closed with an evidence-backed decision.",
+        }
 
-    return {"exec_priorities_top3": priorities[:3]}
+        # Place unknown/confirmation-heavy actions in 0–30
+        if g.get("gap_name") in {"Integration status not confirmed"}:
+            actions_0_30.append(base_action)
+            continue
+
+        # System missing: confirm enable-first then shortlist
+        if g.get("trigger") == "system_missing":
+            actions_0_30.append(base_action)
+            actions_31_60.append(
+                {
+                    "action": f"Define requirements and shortlist options for: {g['gap_name']}",
+                    "owner_role": owner_role,
+                    "dependency": "Confirmed requirements",
+                    "outcome": "A short list is selected based on fit and integration needs.",
+                }
+            )
+            actions_61_90.append(
+                {
+                    "action": f"Pilot or implement chosen approach for: {g['gap_name']}",
+                    "owner_role": owner_role,
+                    "dependency": "Vendor selection and implementation plan",
+                    "outcome": "Capability is live and measured operationally.",
+                }
+            )
+            continue
+
+        # Default placement
+        actions_0_30.append(base_action)
+
+    # Cap list lengths for exec readability
+    def cap(xs: List[Dict[str, Any]], n: int = 6) -> List[Dict[str, Any]]:
+        return xs[:n]
+
+    return {
+        "days_0_30": cap(actions_0_30),
+        "days_31_60": cap(actions_31_60),
+        "days_61_90": cap(actions_61_90),
+    }
