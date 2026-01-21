@@ -1,547 +1,318 @@
-"""
-Executive-grade (V2) report renderer for Hotel Technology & Revenue Readiness.
-
-Design principles:
-- "Unknown" is not a report output state. Use: Observed / Inferred / Unresolved.
-- Every inferred gap includes: consequence, proof path, executive decision, and 90-day definition of done.
-- Vendor-neutral, evidence-led (public signals + booking journey plumbing).
-- Financials are scenario modelling only: transparent assumptions + formula. If inputs missing, defaults are explicit.
-"""
-
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import date
+from typing import Any, Dict, List, Tuple
 
 
-# ------------------------------------------------------------
-# Commercial model (scenario only, transparent)
-# ------------------------------------------------------------
+FORBIDDEN_WORDS = {"likely", "inferred", "probably", "typical", "peer range", "best-in-class", "benchmark"}
+JARGON = {"CRS", "RMS", "CDP", "API", "ETL", "attribution", "middleware", "webhook", "schema"}
 
-def opportunity_model(inputs: Dict[str, Any]) -> Dict[str, Any]:
+
+def _today_iso() -> str:
+    return date.today().isoformat()
+
+
+def build_stack_register_rows(intake: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Scenario-only commercial upside range.
-    Uses conservative uplift band and explicit assumptions.
-
-    Note: This is NOT a forecast. It is a sensitivity range based on room revenue only.
+    Converts intake stack into report stack_register rows.
+    Guarantees all 10 categories appear (schema already enforces presence).
     """
-    inputs = inputs or {}
-    rooms = inputs.get("rooms")
-    occupancy = inputs.get("occupancy")
-    adr = inputs.get("adr")
+    rows: List[Dict[str, Any]] = []
 
-    rooms = 60 if rooms is None else rooms
-    occupancy = 0.72 if occupancy is None else occupancy
-    adr = 140 if adr is None else adr
+    def _emit(category: str, entry: Dict[str, Any]) -> None:
+        rows.append(
+            {
+                "category": category,
+                "vendor": entry.get("vendor", ""),
+                "ownership": entry.get("ownership", "unknown"),
+                "evidence_level": entry.get("evidence_level", "not_provided"),
+                "notes": (entry.get("evidence_notes") or "").strip(),
+            }
+        )
 
-    try:
-        room_revenue = float(rooms) * 365.0 * float(occupancy) * float(adr)
-    except Exception:
-        room_revenue = 0.0
+    for cat in intake["stack"].keys():
+        block = intake["stack"][cat]
+        if isinstance(block, dict) and "systems" in block:
+            for sys in block["systems"]:
+                _emit(cat, sys)
+        else:
+            _emit(cat, block)
 
-    # Conservative uplift range (scenario band)
-    low_pct = 0.013
-    high_pct = 0.05
+    # Some categories allow multi systems; output schema expects minItems 10 overall,
+    # but duplicates are allowed for multi categories.
+    return rows
 
-    low = room_revenue * low_pct
-    high = room_revenue * high_pct
 
+def build_integration_map_rows(intake: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """
+    Builds the canonical integration map. Status is never guessed:
+    - If hotel provided explicit integrations_claimed we still treat link as Unknown unless they assert Active/Not active.
+    This function produces 'unknown_not_confirmed' by default and returns a list of targeted unknowns to ask about.
+    """
+    entity = intake["entity"]
+    # Canonical flows
+    flows = [
+        ("booking_engine", "pms", "reservations"),
+        ("channel_manager_crs", "pms", "rates/availability"),
+        ("rms", "pms", "pricing/forecast inputs & outputs"),
+        ("pms", "crm_guest_db", "guest profiles/stay history"),
+        ("crm_guest_db", "email_lifecycle", "segments/triggers"),
+        ("pms", "finance_accounting", "posting"),
+        ("pms", "reporting_bi", "KPIs/reporting"),
+    ]
+
+    def label(cat: str) -> str:
+        names = {
+            "pms": "PMS",
+            "booking_engine": "Booking engine",
+            "channel_manager_crs": "Channel manager / CRS",
+            "rms": "RMS",
+            "crm_guest_db": "CRM / guest database",
+            "email_lifecycle": "Email / lifecycle marketing",
+            "finance_accounting": "Finance / accounting",
+            "reporting_bi": "Reporting / BI",
+        }
+        return names.get(cat, cat)
+
+    rows: List[Dict[str, Any]] = []
+    unknowns: List[Dict[str, str]] = []
+
+    # Default all links to Unknown unless we add an explicit mechanism later for user to confirm.
+    for f, t, data in flows:
+        rows.append(
+            {
+                "from": f,
+                "to": t,
+                "data": data,
+                "status": "unknown_not_confirmed",
+                "confirmed_by": "Not confirmed",
+                "symptom_if_broken": "Manual work or reporting gaps.",
+            }
+        )
+        unknowns.append({"from_label": label(f), "to_label": label(t), "data": data})
+
+    return rows, unknowns
+
+
+def build_executive_summary(
+    payload: Dict[str, Any],
+    stack_rows: List[Dict[str, Any]],
+    integration_rows: List[Dict[str, Any]],
+    gaps: List[Dict[str, Any]],
+    next_steps: Dict[str, Any],
+    missing_categories: List[str],
+    integration_unknowns: List[Dict[str, str]],
+) -> Dict[str, Any]:
     return {
-        "status": "scenario_only",
-        "assumptions": {"rooms": rooms, "occupancy": occupancy, "adr": adr},
-        "derived": {"room_revenue": round(room_revenue, 2)},
-        "uplift_range": {
-            "low_pct": low_pct,
-            "high_pct": high_pct,
-            "low_gbp": round(low, 0),
-            "high_gbp": round(high, 0),
-        },
-        "primary_levers": [
-            "Pricing accuracy and rate agility",
-            "Direct mix and OTA cost control",
-            "Repeat revenue via guest data automation",
-            "Reduced manual reporting overhead",
+        "report_date": _today_iso(),
+        "confirmed_facts": [
+            f"Tech stack register captured for {payload['entity']['name']} (scope: {payload['entity']['scope']})."
         ],
-        "disclosure": (
-            "Scenario modelling only. Based on room revenue sensitivity to improved commercial execution. "
-            "Excludes F&B/events/spa uplift, longer-term LTV compounding, and portfolio effects."
-        ),
+        "missing_items": missing_categories,
+        "blocked_decisions": [g.get("decision_impaired") for g in gaps[:3] if g.get("decision_impaired")],
+        "top_actions_0_30": [a["action"] for a in next_steps.get("days_0_30", [])[:5]],
+        "integration_unknowns": integration_unknowns,
+        "hotel_provided_evidence": [],  # populate if you ingest file references later
+        "public_market_signals": [],    # populate if you ingest sources later
     }
 
 
-# ------------------------------------------------------------
-# Formatting helpers
-# ------------------------------------------------------------
-
-def _safe_list(x):
-    return x if isinstance(x, list) else []
-
-
-def _fmt_currency(value: Any) -> str:
-    try:
-        return f"£{int(round(float(value))):,}"
-    except Exception:
-        return "£—"
-
-
-def _fmt_pct(value: Any) -> str:
-    try:
-        return f"{float(value) * 100:.0f}%"
-    except Exception:
-        return "—%"
-
-
-def _first_non_empty(*vals: Any) -> Optional[str]:
-    for v in vals:
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-
-def _layer_order() -> List[str]:
-    return [
-        "Distribution",
-        "Core Systems",
-        "Guest Data & CRM",
-        "Commercial Execution",
-        "In-Venue Experience",
-        "Operations",
-        "Finance & Reporting",
-    ]
-
-
-def _status_badge(status: str) -> str:
-    s = (status or "").strip().lower()
-    if s == "observed":
-        return "Observed"
-    if s == "inferred":
-        return "Inferred"
-    if s == "unresolved":
-        return "Unresolved"
-    return "Inferred"
-
-
-def _evidence_strength(detections: List[Dict[str, Any]], status: str) -> str:
+def run_qa_gates(report_json: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Evidence strength is an explanatory label, not a claim of internal usage.
+    Returns pass/fail and details.
+    This is the enforcement layer. If this fails, the API must not publish a final report.
     """
-    st = (status or "").lower()
-    if st == "observed":
-        # strongest confidence among detections
-        best = 0.0
-        for d in detections or []:
-            try:
-                best = max(best, float(d.get("confidence", 0) or 0))
-            except Exception:
-                continue
-        if best >= 0.85:
-            return "High"
-        if best >= 0.55:
-            return "Medium"
-        return "Low"
-    if st == "inferred":
-        return "Low"
-    return "Low"
+    failures: List[Dict[str, str]] = []
 
+    # QA-0: forbidden vocabulary
+    as_text = str(report_json).lower()
+    for w in FORBIDDEN_WORDS:
+        if w in as_text:
+            failures.append({"gate": "QA-0", "message": f"Forbidden word present: '{w}'"})
 
-# ------------------------------------------------------------
-# Tool landscape (illustrative, vendor-neutral examples)
-# ------------------------------------------------------------
+    # QA-1: mandatory categories exist
+    required_cats = {
+        "pms",
+        "booking_engine",
+        "channel_manager_crs",
+        "rms",
+        "crm_guest_db",
+        "email_lifecycle",
+        "in_stay_tools",
+        "housekeeping_maintenance",
+        "finance_accounting",
+        "reporting_bi",
+    }
+    present_cats = {r["category"] for r in report_json.get("stack_register", []) if "category" in r}
+    missing = sorted(list(required_cats - present_cats))
+    if missing:
+        failures.append({"gate": "QA-1", "message": f"Missing stack categories in stack_register: {missing}"})
 
-TOOL_LANDSCAPE: Dict[str, Dict[str, List[str]]] = {
-    "Distribution": {
-        "Booking engine / CRS": ["Sabre SynXis", "SiteMinder", "D-EDGE", "TravelClick", "Avvio"],
-        "Channel management": ["SiteMinder", "DerbySoft", "RateGain", "STAAH"],
-        "Rate intelligence / parity": ["Lighthouse", "OTA Insight"],
-        "Metasearch": ["Google Hotel Ads", "Tripadvisor", "Trivago"],
-    },
-    "Core Systems": {
-        "PMS": ["Oracle OPERA", "Guestline", "Mews", "protel", "Stayntouch"],
-        "RMS": ["Duetto", "IDeaS", "Atomize", "Pace"],
-    },
-    "Guest Data & CRM": {
-        "CRM / Guest profile": ["Revinate", "Cendyn", "Salesforce", "HubSpot"],
-        "Lifecycle & email automation": ["Revinate", "Cendyn", "Klaviyo"],
-        "Reputation & feedback": ["ReviewPro", "TrustYou", "Medallia"],
-    },
-    "Commercial Execution": {
-        "Analytics & BI": ["GA4", "Looker Studio", "Power BI"],
-        "Tag management": ["Google Tag Manager"],
-        "Paid media measurement": ["Google Ads", "Meta Pixel", "Floodlight (CM360)"],
-    },
-    "In-Venue Experience": {
-        "Guest messaging": ["HelloShift", "ALICE", "Akia"],
-        "Mobile check-in / keys": ["Duve", "AeroGuest", "Virdee", "SALTO"],
-        "Upsell & pre-arrival": ["Oaky", "Duve"],
-    },
-    "Operations": {
-        "Housekeeping & tasks": ["HotSOS", "Flexkeeping", "Optii", "ALICE"],
-        "Maintenance / engineering": ["HotSOS", "UpKeep"],
-    },
-    "Finance & Reporting": {
-        "Hotel BI & benchmarking": ["HotStats", "Lighthouse"],
-        "General BI": ["Power BI", "Looker Studio"],
-        "Accounting": ["Xero", "Sage"],
-    },
-}
+    # QA-2: evidence level required
+    for r in report_json.get("stack_register", []):
+        if not r.get("evidence_level"):
+            failures.append({"gate": "QA-2", "message": "Stack row missing evidence_level."})
+            break
 
-_TOOL_NOTE = (
-    "*Illustrative examples only. Selection depends on group governance, integration depth, budget, "
-    "and operating model. This report does not recommend vendors.*"
-)
-
-
-# ------------------------------------------------------------
-# Stack shaping helpers (ensure "full tech stack" output)
-# ------------------------------------------------------------
-
-def _build_full_stack_list(stack_by_layer: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Create a flattened "full stack" view suitable for exec reading.
-    Uses observed detections where present, otherwise inferred/unresolved.
-    """
-    out: List[Dict[str, Any]] = []
-
-    for layer in _layer_order():
-        layer_obj = (stack_by_layer or {}).get(layer, {}) or {}
-        status = _status_badge(layer_obj.get("visibility_state") or layer_obj.get("visibility") or "Inferred")
-        dets = _safe_list(layer_obj.get("detections"))
-        proof = _safe_list(layer_obj.get("proof_path"))
-
-        primary = None
-        evidence_strength = _evidence_strength(dets, status)
-
-        if dets:
-            # pick the highest confidence item
-            best = None
-            best_c = -1.0
-            for d in dets:
-                if not isinstance(d, dict):
-                    continue
-                try:
-                    c = float(d.get("confidence", 0) or 0)
-                except Exception:
-                    c = 0.0
-                if c > best_c:
-                    best_c = c
-                    best = d
-            if best:
-                v = (best.get("vendor") or "").strip()
-                p = (best.get("product") or "").strip()
-                primary = (v + " " + p).strip() or None
-
-        out.append({
-            "layer": layer,
-            "status": status,
-            "primary_candidate": primary,
-            "evidence_strength": evidence_strength,
-            "proof_path": (proof[0] if proof else "Follow booking journey redirects and inspect scripts/cookies for vendor signals."),
-        })
-
-    return out
-
-
-# ------------------------------------------------------------
-# Section renderers
-# ------------------------------------------------------------
-
-def _render_exec_summary(payload: Dict[str, Any]) -> str:
-    meta = payload.get("meta", {}) or {}
-    url = meta.get("url") or payload.get("url") or ""
-    prop_name = meta.get("property_name") or ""
-
-    scores = payload.get("scores", {}) or payload.get("scores", {}) or {}
-    overall = (scores or {}).get("overall_score_0_to_100")
-
-    peer = (scores or {}).get("peer_context") or payload.get("benchmarks") or {}
-    interpretation = peer.get("interpretation")
-    typical_range = peer.get("typical_range")
-    best_in_class = peer.get("best_in_class")
-
-    # Commercial model
-    cm = payload.get("commercial_model") or payload.get("opportunity") or {}
-    upl = cm.get("uplift_range") or {}
-    low_gbp = upl.get("low_gbp")
-    high_gbp = upl.get("high_gbp")
-
-    bench_line = ""
-    if isinstance(typical_range, (list, tuple)) and len(typical_range) == 2:
-        bench_line = f"Peer context: typical {typical_range[0]}–{typical_range[1]} (best-in-class {best_in_class}+)"
-    elif best_in_class is not None:
-        bench_line = f"Peer context: best-in-class {best_in_class}+"
-
-    lines: List[str] = []
-    lines.append("# Hotel Technology & Revenue Readiness Assessment (V2)")
-    if prop_name:
-        lines.append(f"**Property:** {prop_name}")
-    if url:
-        lines.append(f"**Website scanned:** {url}")
-    lines.append("")
-
-    lines.append("## Executive summary")
-    lines.append(f"**Technology Readiness Score:** {overall} / 100")
-    if bench_line:
-        lines.append(f"**{bench_line}**")
-    if interpretation:
-        lines.append(f"**Interpretation:** {interpretation}")
-    lines.append("")
-
-    # Scenario-only opportunity line (never presented as certainty)
-    if isinstance(low_gbp, (int, float)) and isinstance(high_gbp, (int, float)) and high_gbp > 0:
-        lines.append(f"**Commercial upside (scenario range):** {_fmt_currency(low_gbp)} – {_fmt_currency(high_gbp)}")
-        disclosure = cm.get("disclosure")
-        if disclosure:
-            lines.append(f"*{disclosure}*")
+    # QA-3: integration map coverage
+    if len(report_json.get("integration_map", [])) < 7:
+        failures.append({"gate": "QA-3", "message": "Integration map does not include all canonical flows."})
     else:
-        lines.append("**Commercial upside:** Not quantified in this run (scenario model unavailable).")
-    lines.append("")
+        for row in report_json["integration_map"]:
+            if row.get("status") not in {"active_confirmed", "not_active_confirmed", "unknown_not_confirmed"}:
+                failures.append({"gate": "QA-3", "message": "Integration row has invalid or missing status."})
+                break
 
-    lines.append(
-        "This report is evidence-led from a bounded public crawl (including booking journey plumbing where discoverable). "
-        "Capabilities are labelled **Observed / Inferred / Unresolved**—lack of public visibility is not treated as absence."
-    )
+    # QA-4: gaps must be CEO-valid
+    for g in report_json.get("gaps", []):
+        required = [
+            "gap_name",
+            "missing_or_broken_fact",
+            "operational_symptom",
+            "decision_impaired",
+            "risk_if_unchanged",
+            "owner_function",
+            "close_gap_action",
+        ]
+        if any(not g.get(k) for k in required):
+            failures.append({"gate": "QA-4", "message": f"Gap missing required CEO fields: {g.get('gap_name','(unnamed)')}"})
+            break
 
-    return "\n".join(lines).strip()
+    # QA-5: no fabricated ROI (basic numeric check in report text)
+    # This is a lightweight guard: if currency signs appear in commercial_impact while quantified is false, fail.
+    ci = report_json.get("commercial_impact", {})
+    if not ci.get("quantified", False):
+        if "£" in str(ci) or "%" in str(ci):
+            failures.append({"gate": "QA-5", "message": "Numeric impact present without quantified=true and stated inputs."})
 
+    # QA-8: jargon without definition (simple)
+    # If jargon terms appear, require a definitions section (not implemented here) — so we just fail early.
+    # In practice you can soften this, but this keeps you honest.
+    for term in JARGON:
+        if term.lower() in as_text:
+            # allow if explicitly defined (you can implement a definitions block later)
+            failures.append({"gate": "QA-8", "message": f"Jargon term detected without guaranteed definition: {term}"})
+            break
 
-def _render_evidence(payload: Dict[str, Any]) -> str:
-    ev = payload.get("evidence", {}) or {}
-    crawl = ev.get("crawl", {}) or ev
-    booking = ev.get("booking_flow", {}) or {}
-
-    pages = _safe_list(crawl.get("pages_fetched"))
-    domains = _safe_list(crawl.get("top_third_party_domains"))
-    cookie_keys = _safe_list(crawl.get("cookie_keys_observed"))
-
-    final_domain = booking.get("final_domain")
-    redirect_chain = _safe_list(booking.get("redirect_chain"))
-    booking_cookies = _safe_list(booking.get("cookie_keys"))
-
-    out: List[str] = []
-    out.append("## Evidence register (public signals)")
-    if final_domain:
-        out.append(f"- **Booking journey final domain:** `{final_domain}`")
-    if redirect_chain:
-        out.append(f"- **Booking redirect chain (sample):** " + " → ".join([f"`{x}`" for x in redirect_chain[:4]]) + (" …" if len(redirect_chain) > 4 else ""))
-    if booking_cookies:
-        out.append(f"- **Booking cookie keys (sample):** " + ", ".join([f"`{x}`" for x in booking_cookies[:10]]) + (" …" if len(booking_cookies) > 10 else ""))
-
-    if domains:
-        out.append(f"- **Third-party domains observed (sample):** " + ", ".join([f"`{d}`" for d in domains[:12]]) + (" …" if len(domains) > 12 else ""))
-
-    if cookie_keys and not booking_cookies:
-        out.append(f"- **Site cookie keys observed (sample):** " + ", ".join([f"`{k}`" for k in cookie_keys[:12]]) + (" …" if len(cookie_keys) > 12 else ""))
-
-    if pages:
-        out.append(f"- **Pages fetched:** {len(pages)} (bounded crawl)")
-    errs = _safe_list(crawl.get("crawl_errors"))
-    if errs:
-        out.append(f"- **Crawl errors:** {len(errs)} (non-fatal)")
-    out.append("")
-    return "\n".join(out).strip()
+    return {"pass": len(failures) == 0, "failures": failures}
 
 
-def _render_stack_table(full_stack_list: List[Dict[str, Any]]) -> str:
-    out: List[str] = []
-    out.append("## Tech stack view (capability coverage)")
-    out.append("| Layer | Status | Primary observed candidate | Evidence strength | Proof path |")
-    out.append("|---|---|---|---|---|")
-    for row in full_stack_list:
-        out.append(
-            f"| {row.get('layer','')} | {row.get('status','')} | {row.get('primary_candidate') or '—'} | "
-            f"{row.get('evidence_strength','Low')} | {row.get('proof_path','')} |"
+def render_markdown_report(report_json: Dict[str, Any], executive_summary: Dict[str, Any]) -> str:
+    """
+    Forces the exec template. No section, no report.
+    """
+    meta = report_json["meta"]
+    title = f"# {meta['entity_name']} — Confirmed Tech Stack & Integration Read (Evidence-Based)\n"
+    header = f"**Date:** {meta['report_date']}  \n**Scope:** {meta['scope']}\n\n"
+
+    # Exec Summary
+    exec_lines = ["## Executive Summary\n"]
+    for b in executive_summary.get("confirmed_facts", []):
+        exec_lines.append(f"- {b}")
+    if executive_summary.get("missing_items"):
+        exec_lines.append("\n**Still required to complete:**")
+        for m in executive_summary["missing_items"]:
+            exec_lines.append(f"- {m}")
+    exec_lines.append("\n**Top actions (next 30 days):**")
+    for a in executive_summary.get("top_actions_0_30", [])[:5]:
+        exec_lines.append(f"- {a}")
+    exec_lines.append("")
+
+    # Stack Register
+    sr = ["## Confirmed Stack Register\n"]
+    sr.append("| Category | Vendor | Ownership | Evidence | Notes |")
+    sr.append("|---|---|---|---|---|")
+    for r in report_json["stack_register"]:
+        sr.append(
+            f"| {r['category']} | {r['vendor']} | {r['ownership']} | {r['evidence_level']} | {r.get('notes','')} |"
         )
-    out.append("")
-    return "\n".join(out).strip()
+    sr.append("")
 
+    # Integration Map
+    im = ["## Integration Map (Current State)\n"]
+    im.append("| From | To | Data | Status | Confirmed by | Symptom if broken |")
+    im.append("|---|---|---|---|---|---|")
+    for row in report_json["integration_map"]:
+        im.append(
+            f"| {row['from']} | {row['to']} | {row['data']} | {row['status']} | {row['confirmed_by']} | {row['symptom_if_broken']} |"
+        )
+    im.append("")
 
-def _render_layer(layer_name: str, layer_obj: Dict[str, Any]) -> str:
-    status = _status_badge(layer_obj.get("visibility_state") or layer_obj.get("visibility") or "Inferred")
-    importance = layer_obj.get("strategic_importance", "Medium")
-    rationale = layer_obj.get("importance_rationale") or ""
-    dets = _safe_list(layer_obj.get("detections"))
+    # Grades
+    gr = ["## CEO-Aligned Grades\n"]
+    gr.append("| Dimension | Grade | Why | What moves this up one grade |")
+    gr.append("|---|---|---|---|")
+    for g in report_json["grades"]:
+        reasons = "; ".join(g.get("reasons", []))
+        gr.append(f"| {g['dimension']} | {g['grade']} | {reasons} | {g['improvement_to_next_grade']} |")
+    gr.append("")
 
-    likely_state = layer_obj.get("likely_state") or ""
-    typical_risk = layer_obj.get("typical_risk") or ""
-    proof = _safe_list(layer_obj.get("proof_path"))
-    decision = layer_obj.get("exec_decision") or ""
-    good = _safe_list(layer_obj.get("what_good_looks_like_90d"))
-
-    # Observed signals summary
-    observed_lines: List[str] = []
-    if dets:
-        # show up to 4 signals
-        for d in dets[:4]:
-            if not isinstance(d, dict):
-                continue
-            v = (d.get("vendor") or "").strip()
-            p = (d.get("product") or "").strip()
-            lab = (d.get("label") or "").strip()
-            src = (d.get("source") or "").strip()
-            conf = d.get("confidence", "")
-            evidence = _safe_list(d.get("evidence"))
-            ev_snip = f" — {evidence[0]}" if evidence else ""
-            observed_lines.append(f"- **{(v + ' ' + p).strip()}** ({lab}, {conf}, {src}){ev_snip}")
+    # Gaps
+    gaps = ["## Gap Register\n"]
+    if not report_json["gaps"]:
+        gaps.append("No CEO-valid gaps could be asserted from the confirmed inputs.")
     else:
-        observed_lines.append("- No vendor/product signals were directly observable from the public crawl for this layer.")
+        for idx, g in enumerate(report_json["gaps"], start=1):
+            gaps.append(f"### Gap {idx}: {g['gap_name']}")
+            gaps.append(f"- **What is missing/broken (fact):** {g['missing_or_broken_fact']}")
+            gaps.append(f"- **Where it shows up (symptom):** {g['operational_symptom']}")
+            gaps.append(f"- **Decision impaired:** {g['decision_impaired']}")
+            gaps.append(f"- **Risk if unchanged:** {g['risk_if_unchanged']}")
+            gaps.append(f"- **Owner:** {g['owner_function']}")
+            gaps.append(f"- **Close-the-gap action:** {g['close_gap_action']}")
+            gaps.append("")
+    gaps.append("")
 
-    # Tool options (illustrative)
-    tools = layer_obj.get("tool_options") or TOOL_LANDSCAPE.get(layer_name) or {}
+    # Recommendations
+    rec = ["## Recommendations (Only where eligible)\n"]
+    if not report_json["recommendations"]:
+        rec.append("No recommendations issued because no eligible confirmed gaps were present.")
+    else:
+        for r in report_json["recommendations"]:
+            rec.append(f"### For: {r['gap_name']}")
+            rec.append(f"- **Enable-first path:** {r['enable_first_path']}")
+            rec.append("- **Options:**")
+            for opt in r["tool_options"]:
+                rec.append(f"  - {opt['vendor']}: {opt['why_fit']} (trade-offs: {opt['tradeoffs']})")
+            rec.append("- **Selection criteria:**")
+            for c in r["selection_criteria"]:
+                rec.append(f"  - {c}")
+            if r.get("market_risks"):
+                rec.append("- **Market risks (signals):**")
+                for mr in r["market_risks"]:
+                    rec.append(f"  - {mr['risk_statement']} (sources: {', '.join(mr['source_refs'])})")
+            rec.append("")
+    rec.append("")
 
-    out: List[str] = []
-    out.append(f"### {layer_name}")
-    out.append(f"**Status:** {status}  |  **Strategic importance:** {importance}")
-    if rationale:
-        out.append(f"*{rationale}*")
-    out.append("")
-    out.append("**Observed signals:**")
-    out.extend(observed_lines)
-    out.append("")
+    # Commercial impact
+    ci = report_json.get("commercial_impact", {})
+    ci_md = ["## Commercial Impact\n", ci.get("statement", "Impact not quantified."), ""]
 
-    if status != "Observed":
-        if likely_state:
-            out.append(f"**Inferred internal state:** {likely_state}")
-        if typical_risk:
-            out.append(f"**Consequence if left unresolved:** {typical_risk}")
-        if proof:
-            out.append("**Fastest proof path (public / single-URL adjacent):**")
-            out.extend([f"- {x}" for x in proof[:4]])
-        out.append("")
+    # Next steps
+    ns = ["## Next Steps\n"]
+    def _render_actions(label: str, actions: List[Dict[str, Any]]) -> None:
+        ns.append(f"### {label}")
+        if not actions:
+            ns.append("- No actions defined.")
+            return
+        for a in actions:
+            ns.append(f"- {a['action']} — **Owner:** {a['owner_role']} — **Dependency:** {a['dependency']} — **Outcome:** {a['outcome']}")
+        ns.append("")
 
-    if decision:
-        out.append("**Executive decision this gap resolves into:**")
-        out.append(f"- {decision}")
-        out.append("")
+    _render_actions("0–30 days", report_json["next_steps"]["days_0_30"])
+    _render_actions("31–60 days", report_json["next_steps"]["days_31_60"])
+    _render_actions("61–90 days", report_json["next_steps"]["days_61_90"])
 
-    if good:
-        out.append("**What good looks like in 90 days:**")
-        out.extend([f"- {x}" for x in good[:6]])
-        out.append("")
+    # Evidence & sources
+    src = ["## Evidence & Sources\n"]
+    src.append("- **Hotel-provided:** " + (", ".join(report_json["sources"]["hotel_provided"]) or "None provided"))
+    if report_json["sources"]["public_market_signals"]:
+        src.append("- **Public market signals:**")
+        for s in report_json["sources"]["public_market_signals"]:
+            src.append(f"  - {s['type']}: {s['title']} ({s['publisher']}, {s['date']}) — {s['url_or_ref']}")
+    else:
+        src.append("- **Public market signals:** None included")
+    src.append("")
 
-    if tools:
-        out.append("**Common tool options in comparable hotels (illustrative):**")
-        for cap, vendors in tools.items():
-            if isinstance(vendors, list) and vendors:
-                out.append(f"- **{cap}:** " + ", ".join(vendors[:4]))
-        out.append(_TOOL_NOTE)
-
-    return "\n".join(out).strip()
-
-
-def _render_comparison(payload: Dict[str, Any]) -> str:
-    comp = payload.get("comparison") or {}
-    competitor = payload.get("competitor") or {}
-
-    if not comp:
-        return ""
-
-    out: List[str] = []
-    out.append("## Competitor comparison (public-signal)")
-    delta = comp.get("score_delta")
-    if delta is not None:
-        out.append(f"**Score delta (property - competitor):** {delta:+.1f} points")
-    a_dom = comp.get("booking_engine_domain_a")
-    b_dom = comp.get("booking_engine_domain_b")
-    if a_dom or b_dom:
-        out.append(f"- Booking domain (property): `{a_dom or '—'}`")
-        out.append(f"- Booking domain (competitor): `{b_dom or '—'}`")
-
-    layer_deltas = _safe_list(comp.get("layer_deltas"))
-    if layer_deltas:
-        out.append("")
-        out.append("| Layer | Delta |")
-        out.append("|---|---:|")
-        for ld in layer_deltas:
-            if isinstance(ld, dict) and ld.get("layer") is not None and ld.get("delta") is not None:
-                out.append(f"| {ld['layer']} | {ld['delta']:+.1f} |")
-
-    notes = _safe_list(comp.get("notes"))
-    if notes:
-        out.append("")
-        out.extend([f"- {n}" for n in notes[:4]])
-
-    # Light competitor pointer
-    c_url = competitor.get("url")
-    if c_url:
-        out.append("")
-        out.append(f"*Competitor scanned:* {c_url}")
-
-    out.append("")
-    return "\n".join(out).strip()
-
-
-def _render_methodology(payload: Dict[str, Any]) -> str:
-    cm = payload.get("commercial_model") or payload.get("opportunity") or {}
-    disclosure = cm.get("disclosure") or "Scenario modelling is clearly labelled; no internal data is accessed."
-
-    out: List[str] = []
-    out.append("## Methodology & disclosures")
-    out.append("- Bounded public crawl (homepage + selected internal links + booking CTA discovery where available).")
-    out.append("- Signals derived from: script tags, iframes, form actions, redirect domains, cookie keys, and third-party domains.")
-    out.append("- No authentication, no form submission, no privileged access, no guest data.")
-    out.append(f"- Financials: {disclosure}")
-    out.append("- Vendor-neutral; tool examples are illustrative only and not recommendations.")
-    return "\n".join(out).strip()
-
-
-# ------------------------------------------------------------
-# Main renderer (V2)
-# ------------------------------------------------------------
-
-def render_report_md(payload: Dict[str, Any]) -> str:
-    """
-    Executive-grade markdown report.
-    Accepts your analysis dict. Tolerates partial inputs.
-
-    Expected keys (best effort):
-    - meta/url
-    - scores / benchmarks
-    - stack.by_layer or layers
-    - evidence
-    - commercial_model/opportunity
-    - comparison (optional)
-    """
-    payload = payload or {}
-
-    # Normalize inputs from older versions
-    meta = payload.get("meta") or {}
-    if not meta.get("url") and payload.get("url"):
-        meta["url"] = payload.get("url")
-    payload["meta"] = meta
-
-    # Normalize stack container
-    stack = payload.get("stack") or {}
-    stack_by_layer = (stack.get("by_layer") or payload.get("layers") or {})
-    stack["by_layer"] = stack_by_layer
-    payload["stack"] = stack
-
-    # Ensure a full stack list exists
-    full_stack_list = stack.get("full_stack_list")
-    if not isinstance(full_stack_list, list) or not full_stack_list:
-        full_stack_list = _build_full_stack_list(stack_by_layer)
-        stack["full_stack_list"] = full_stack_list
-
-    # Ensure a commercial model exists if opportunity exists
-    if not payload.get("commercial_model") and payload.get("opportunity"):
-        payload["commercial_model"] = payload.get("opportunity")
-
-    sections: List[str] = []
-    sections.append(_render_exec_summary(payload))
-    sections.append("")
-    sections.append(_render_evidence(payload))
-    sections.append("")
-    sections.append(_render_stack_table(full_stack_list))
-    sections.append("")
-
-    sections.append("## Layer-by-layer assessment (decision-led)")
-    for layer_name in _layer_order():
-        layer_obj = (stack_by_layer or {}).get(layer_name, {}) or {}
-        sections.append(_render_layer(layer_name, layer_obj))
-        sections.append("")
-
-    comp_md = _render_comparison(payload)
-    if comp_md:
-        sections.append(comp_md)
-
-    sections.append(_render_methodology(payload))
-
-    return "\n".join([s for s in sections if isinstance(s, str) and s.strip()]).strip()
+    return "\n".join([title, header] + exec_lines + sr + im + gr + gaps + rec + ci_md + ns + src)
