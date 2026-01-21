@@ -1,57 +1,56 @@
-version: 1
-products:
-  - vendor: SiteMinder
-    product: SiteMinder Booking Engine
-    category: Distribution
-    patterns:
-      - type: domain_contains
-        value: thebookingbutton.com
-        weight: 0.95
+version: 2
+purpose: >
+  Signal-led prompts only. This file must never be used to assert system presence.
+  Detected signals can only produce "confirmation prompts" and "candidate vendors".
 
-  - vendor: STAAH
-    product: STAAH Booking / Channel Tech
-    category: Distribution
-    patterns:
-      - type: domain_contains
-        value: staah.com
-        weight: 0.9
+global_rules:
+  - "Signals are not facts."
+  - "No output may label a vendor as 'in use' based on detection."
+  - "Absence of a signal is not evidence of absence."
+  - "Use signals to reduce friction in the Stack Confirmation Questionnaire."
 
-  - vendor: Guestline
-    product: Guestline Booking / PMS Signals
-    category: Core Systems
-    patterns:
-      - type: domain_contains
-        value: guestline.net
-        weight: 0.85
+signals:
+  booking_flow:
+    - id: booking_redirect_domain
+      description: "Booking journey redirects off-domain"
+      prompt: "Your booking journey appears to redirect off-domain. Which booking engine vendor runs your direct booking flow?"
+      category: booking_engine
 
-  - vendor: Mews
-    product: Mews PMS / Guest Journey Signals
-    category: Core Systems
-    patterns:
-      - type: domain_contains
-        value: mews.li
-        weight: 0.9
+  tracking:
+    - id: gtm_present
+      description: "Google Tag Manager container detected"
+      prompt: "Google Tag Manager is present. Please confirm which analytics platform you use for reporting (e.g., GA4), and whether booking confirmations are tracked."
+      category: reporting_bi
 
-  - vendor: Revinate
-    product: Revinate CRM / Reputation
-    category: Guest Data & CRM
-    patterns:
-      - type: domain_contains
-        value: revinate.com
-        weight: 0.8
+  cms:
+    - id: wordpress
+      description: "WordPress detected"
+      prompt: "Your website appears to use WordPress. Who owns content publishing and conversion optimisation (property or group)?"
+      category: reporting_bi
 
-  - vendor: Google
-    product: Google Tag Manager
-    category: Commercial Execution
-    patterns:
-      - type: text_regex
-        value: "googletagmanager.com/gtm.js"
-        weight: 0.9
+candidate_vendors:
+  # These are NOT assertions. They are used to present a shortlist in the confirmation UI.
+  # Example: when a domain pattern or script pattern matches.
+  booking_engine:
+    - vendor: "SynXis Booking Engine"
+      confidence: "signal_only"
+      notes: "Only show as a selectable option if a relevant signal pattern matched."
+    - vendor: "TravelClick iHotelier"
+      confidence: "signal_only"
+      notes: "Only show as a selectable option if a relevant signal pattern matched."
+    - vendor: "SiteMinder"
+      confidence: "signal_only"
+      notes: "Only show as a selectable option if a relevant signal pattern matched."
 
-  - vendor: Google
-    product: Google Analytics
-    category: Commercial Execution
-    patterns:
-      - type: text_regex
-        value: "google-analytics.com|gtag\\("
-        weight: 0.75
+  pms:
+    - vendor: "Oracle OPERA"
+      confidence: "signal_only"
+      notes: "Never present as confirmed. Use only as a shortlist option."
+    - vendor: "Mews"
+      confidence: "signal_only"
+      notes: "Never present as confirmed. Use only as a shortlist option."
+
+output_contract:
+  # What the detector layer is allowed to output to the product
+  allowed
+
