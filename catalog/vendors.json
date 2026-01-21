@@ -1,22 +1,132 @@
 {
-  "vendor": "string",
-  "category": "one_of_known_categories",
-  "capability_type": "system | augmentation | automation",
-  "primary_functions": ["string"],
-  "required_integrations": ["stack_category"],
-  "optional_integrations": ["stack_category"],
-  "data_dependencies": ["string"],
-  "operational_dependencies": ["string"],
-  "common_risks": [
+  "version": "1.0",
+  "last_updated": "2026-01-21",
+  "vendors": [
     {
-      "risk": "string",
-      "source_type": "review | forum | analyst | vendor_doc",
-      "notes": "string"
+      "vendor": "IDeaS",
+      "category": "rms",
+      "capability_type": "system",
+      "primary_functions": [
+        "Automated pricing recommendations",
+        "Demand forecasting"
+      ],
+      "required_integrations": ["pms"],
+      "optional_integrations": ["channel_manager_crs", "reporting_bi"],
+      "data_dependencies": [
+        "Historical reservations",
+        "Forward bookings",
+        "Rate and availability data"
+      ],
+      "operational_dependencies": [
+        "Pricing governance",
+        "Override discipline",
+        "Revenue team adoption"
+      ],
+      "common_risks": [
+        {
+          "risk": "Limited value when overrides are frequent",
+          "source_type": "review",
+          "notes": "Frequently cited in industry reviews discussing RMS adoption."
+        }
+      ],
+      "ai_usage": {
+        "uses_ai": true,
+        "ai_role": "predictive",
+        "human_in_loop_required": true
+      }
+    },
+    {
+      "vendor": "HubSpot",
+      "category": "crm_guest_db",
+      "capability_type": "system",
+      "primary_functions": [
+        "Guest profile management",
+        "Lifecycle communications"
+      ],
+      "required_integrations": ["pms"],
+      "optional_integrations": ["email_lifecycle", "reporting_bi"],
+      "data_dependencies": [
+        "Guest identity resolution",
+        "Stay history"
+      ],
+      "operational_dependencies": [
+        "Data hygiene",
+        "Marketing ownership"
+      ],
+      "common_risks": [
+        {
+          "risk": "CRM value limited without reliable PMS data sync",
+          "source_type": "forum",
+          "notes": "Common theme in hotel CRM discussions."
+        }
+      ],
+      "ai_usage": {
+        "uses_ai": true,
+        "ai_role": "assistive",
+        "human_in_loop_required": true
+      }
+    },
+    {
+      "vendor": "Power BI",
+      "category": "reporting_bi",
+      "capability_type": "system",
+      "primary_functions": [
+        "Cross-system reporting",
+        "Executive dashboards"
+      ],
+      "required_integrations": ["pms"],
+      "optional_integrations": ["finance_accounting", "crm_guest_db"],
+      "data_dependencies": [
+        "Structured data models",
+        "Consistent KPI definitions"
+      ],
+      "operational_dependencies": [
+        "Data ownership",
+        "Report governance"
+      ],
+      "common_risks": [
+        {
+          "risk": "Inconsistent reporting without agreed KPIs",
+          "source_type": "analyst",
+          "notes": "Common BI implementation risk across hospitality."
+        }
+      ],
+      "ai_usage": {
+        "uses_ai": false,
+        "ai_role": "none",
+        "human_in_loop_required": true
+      }
+    },
+    {
+      "vendor": "Custom AI Pricing Assistant",
+      "category": "ai_decision_support",
+      "capability_type": "augmentation",
+      "primary_functions": [
+        "Explain pricing recommendations",
+        "Highlight demand anomalies"
+      ],
+      "required_integrations": ["rms", "pms"],
+      "optional_integrations": ["reporting_bi"],
+      "data_dependencies": [
+        "RMS outputs",
+        "Historical pricing decisions"
+      ],
+      "operational_dependencies": [
+        "Clear decision authority",
+        "Human review process"
+      ],
+      "common_risks": [
+        {
+          "risk": "Low trust if explanations are not transparent",
+          "source_type": "forum",
+          "notes": "AI explainability frequently raised as adoption barrier."
+        }
+      ],
+      "ai_usage": {
+        "uses_ai": true,
+        "ai_role": "assistive",
+        "human_in_loop_required": true
+      }
     }
-  ],
-  "ai_usage": {
-    "uses_ai": true,
-    "ai_role": "assistive | predictive | generative",
-    "human_in_loop_required": true
-  }
+  ]
 }
