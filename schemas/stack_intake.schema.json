@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hotel-tech-stacker/schemas/stack_intake.schema.json",
+  "title": "Hotel Tech Stacker – Stack Intake Schema",
+  "type": "object",
+  "required": ["entity", "stack"],
+  "additionalProperties": false,
+
+  "properties": {
+    "entity": {
+      "type": "object",
+      "required": ["name", "scope"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Hotel or group name"
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["property", "group"],
+          "description": "Assessment scope"
+        },
+        "country": {
+          "type": "string",
+          "description": "Primary operating country"
+        }
+      }
+    },
+
+    "stack": {
+      "type": "object",
+      "required": [
+        "pms",
+        "booking_engine",
+        "channel_manager_crs",
+        "rms",
+        "crm_guest_db",
+        "email_lifecycle",
+        "in_stay_tools",
+        "housekeeping_maintenance",
+        "finance_accounting",
+        "reporting_bi"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pms": { "$ref": "#/$defs/systemEntry" },
+        "booking_engine": { "$ref": "#/$defs/systemEntry" },
+        "channel_manager_crs": { "$ref": "#/$defs/systemEntry" },
+        "rms": { "$ref": "#/$defs/systemEntry" },
+        "crm_guest_db": { "$ref": "#/$defs/systemEntry" },
+        "email_lifecycle": { "$ref": "#/$defs/systemEntry" },
+        "finance_accounting": { "$ref": "#/$defs/systemEntry" },
+        "reporting_bi": { "$ref": "#/$defs/systemEntry" },
+
+        "in_stay_tools": { "$ref": "#/$defs/systemEntryMulti" },
+        "housekeeping_maintenance": { "$ref": "#/$defs/systemEntryMulti" }
+      }
+    },
+
+    "integrations": {
+      "type": "array",
+      "description": "Explicit confirmation of core data flows. Missing flows default to unknown.",
+      "items": { "$ref": "#/$defs/integrationEntry" }
+    }
+  },
+
+  "$defs": {
+    "evidenceLevel": {
+      "type": "string",
+      "enum": [
+        "confirmed_self_reported",
+        "confirmed_evidence_backed",
+        "none_not_in_use",
+        "not_provided"
+      ]
+    },
+
+    "ownership": {
+      "type": "string",
+      "enum": ["property", "group", "unknown"]
+    },
+
+    "systemEntry": {
+      "type": "object",
+      "required": ["vendor", "ownership", "evidence_level"],
+      "additionalProperties": false,
+      "properties": {
+        "vendor": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Vendor name, or 'None' or 'Not provided'"
+        },
+        "ownership": { "$ref": "#/$defs/ownership" },
+        "evidence_level": { "$ref": "#/$defs/evidenceLevel" },
+        "evidence_notes": {
+          "type": "string",
+          "description": "Optional supporting notes or evidence reference"
+        }
+      }
+    },
+
+    "systemEntryMulti": {
+      "type": "object",
+      "required": ["systems"],
+      "additionalProperties": false,
+      "properties": {
+        "systems": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/systemEntry" }
+        }
+      }
+    },
+
+    "integrationEntry": {
+      "type": "object",
+      "required": ["from", "to", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "type": "string",
+          "enum": [
+            "booking_engine",
+            "channel_manager_crs",
+            "rms",
+            "pms",
+            "crm_guest_db"
+          ],
+          "description": "Source system category"
+        },
+        "to": {
+          "type": "string",
+          "enum": [
+            "pms",
+            "crm_guest_db",
+            "email_lifecycle",
+            "finance_accounting",
+            "reporting_bi"
+          ],
+          "description": "Destination system category"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active_confirmed",
+            "not_active_confirmed",
+            "unknown_not_confirmed"
+          ],
+          "description": "Confirmed integration status"
+        },
+        "confirmed_by": {
+          "type": "string",
+          "description": "Role or person confirming this status (optional)"
+        },
+        "symptom_if_broken": {
+          "type": "string",
+          "description": "Observed operational issue if not active (optional)"
+        }
+      }
+    }
+  }
+}
