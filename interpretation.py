@@ -97,4 +97,60 @@ def build_recommendations(
 
         name = g["gap_name"]
 
-        #
+        # Keep options generic until you add vendor catalog + market sources.
+        if name == "No central reporting view":
+            recs.append(
+                {
+                    "gap_name": name,
+                    "enable_first_path": "Confirm whether existing finance or PMS reporting can meet the KPI set before introducing a new BI layer.",
+                    "tool_options": [
+                        {"vendor": "Microsoft Power BI", "why_fit": "Commonly used for multi-source dashboards across finance and operations.", "tradeoffs": "Requires data modelling and ongoing governance."},
+                        {"vendor": "Tableau", "why_fit": "Strong visualisation and enterprise reporting capability.", "tradeoffs": "Licensing and implementation effort can be higher."},
+                    ],
+                    "selection_criteria": [
+                        "Can it combine PMS, channel, finance, and guest data sources?",
+                        "Who will own data governance and KPI definitions?",
+                        "How quickly can leadership get a weekly performance pack from it?",
+                    ],
+                    "market_risks": [],
+                }
+            )
+
+        if name == "No confirmed revenue management system":
+            recs.append(
+                {
+                    "gap_name": name,
+                    "enable_first_path": "Confirm whether your PMS or existing commercial tooling already supports rate automation before adding a standalone RMS.",
+                    "tool_options": [
+                        {"vendor": "IDeaS", "why_fit": "Widely used RMS in hotels for automated pricing and forecasting.", "tradeoffs": "Implementation quality depends on data hygiene and process adoption."},
+                        {"vendor": "Duetto", "why_fit": "Cloud RMS focused on pricing and demand forecasting workflows.", "tradeoffs": "Requires strong integration discipline to avoid manual overrides."},
+                    ],
+                    "selection_criteria": [
+                        "Integration support with your PMS and channel manager",
+                        "Ability to support group-level governance and property-level execution",
+                        "Clarity of audit trail for pricing decisions",
+                    ],
+                    "market_risks": [],
+                }
+            )
+
+        if name == "Integration status not confirmed":
+            # This is a process recommendation rather than a tool push.
+            recs.append(
+                {
+                    "gap_name": name,
+                    "enable_first_path": "Run a 30-minute confirmation workshop: confirm each flow as Active or Not active and document any manual steps.",
+                    "tool_options": [
+                        {"vendor": "Integration audit worksheet", "why_fit": "Fastest path to certainty without buying new systems.", "tradeoffs": "Requires stakeholder time and accurate answers."},
+                        {"vendor": "iPaaS (only if required)", "why_fit": "Consider only if confirmed integrations cannot be activated natively.", "tradeoffs": "Adds integration complexity and ongoing dependency."},
+                    ],
+                    "selection_criteria": [
+                        "Can native integrations be enabled first?",
+                        "Is there a clear owner for integration governance?",
+                        "Is the integration need repeatable across properties?",
+                    ],
+                    "market_risks": [],
+                }
+            )
+
+    return recs
