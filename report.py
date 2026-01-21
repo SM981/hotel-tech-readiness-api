@@ -1,3 +1,4 @@
+from typing import Any, Dict, List, Tuple
 def build_integration_map_rows(intake: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
     """
     Builds the canonical integration map from intake-confirmed statuses.
