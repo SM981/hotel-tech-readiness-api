@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hotel-tech-stacker/schemas/report_output.schema.json",
+  "title": "Hotel Tech Stacker – Executive Report Output Schema",
+  "type": "object",
+  "required": [
+    "meta",
+    "stack_register",
+    "integration_map",
+    "grades",
+    "gaps",
+    "recommendations",
+    "next_steps",
+    "sources"
+  ],
+  "additionalProperties": false,
+
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["entity_name", "scope", "report_date", "truth_standard"],
+      "additionalProperties": false,
+      "properties": {
+        "entity_name": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string", "enum": ["property", "group"] },
+        "report_date": { "type": "string", "format": "date" },
+        "truth_standard": {
+          "type": "string",
+          "enum": ["no_assumptions", "facts_and_market_signals"]
+        }
+      }
+    },
+
+    "stack_register": {
+      "type": "array",
+      "minItems": 10,
+      "items": { "$ref": "#/$defs/stackRegisterRow" }
+    },
+
+    "integration_map": {
+      "type": "array",
+      "minItems": 7,
+      "items": { "$ref": "#/$defs/integrationRow" }
+    },
+
+    "grades": {
+      "type": "array",
+      "minItems": 5,
+      "items": { "$ref": "#/$defs/gradeRow" }
+    },
+
+    "gaps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/gapRow" }
+    },
+
+    "recommendations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/recommendationRow" }
+    },
+
+    "commercial_impact": {
+      "type": "object",
+      "required": ["quantified", "statement"],
+      "additionalProperties": false,
+      "properties": {
+        "quantified": { "type": "boolean" },
+        "statement": { "type": "string", "minLength": 1 },
+        "inputs_used": { "type": "array", "items": { "type": "string" } },
+        "assumptions": { "type": "array", "items": { "type": "string" } },
+        "calculations_summary": { "type": "string" }
+      }
+    },
+
+    "next_steps": {
+      "type": "object",
+      "required": ["days_0_30", "days_31_60", "days_61_90"],
+      "additionalProperties": false,
+      "properties": {
+        "days_0_30": { "type": "array", "items": { "$ref": "#/$defs/actionRow" } },
+        "days_31_60": { "type": "array", "items": { "$ref": "#/$defs/actionRow" } },
+        "days_61_90": { "type": "array", "items": { "$ref": "#/$defs/actionRow" } }
+      }
+    },
+
+    "sources": {
+      "type": "object",
+      "required": ["hotel_provided", "public_market_signals"],
+      "additionalProperties": false,
+      "properties": {
+        "hotel_provided": { "type": "array", "items": { "type": "string" } },
+        "public_market_signals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/publicSource" }
+        }
+      }
+    }
+  },
+
+  "$defs": {
+    "stackCategory": {
+      "type": "string",
+      "enum": [
+        "pms",
+        "booking_engine",
+        "channel_manager_crs",
+        "rms",
+        "crm_guest_db",
+        "email_lifecycle",
+        "in_stay_tools",
+        "housekeeping_maintenance",
+        "finance_accounting",
+        "reporting_bi"
+      ]
+    },
+
+    "evidenceLevel": {
+      "type": "string",
+      "enum": [
+        "confirmed_self_reported",
+        "confirmed_evidence_backed",
+        "none_not_in_use",
+        "not_provided"
+      ]
+    },
+
+    "integrationStatus": {
+      "type": "string",
+      "enum": ["active_confirmed", "not_active_confirmed", "unknown_not_confirmed"]
+    },
+
+    "stackRegisterRow": {
+      "type": "object",
+      "required": ["category", "vendor", "ownership", "evidence_level"],
+      "additionalProperties": false,
+      "properties": {
+        "category": { "$ref": "#/$defs/stackCategory" },
+        "vendor": { "type": "string", "minLength": 1 },
+        "ownership": { "type": "string", "enum": ["property", "group", "unknown"] },
+        "evidence_level": { "$ref": "#/$defs/evidenceLevel" },
+        "notes": { "type": "string" }
+      }
+    },
+
+    "integrationRow": {
+      "type": "object",
+      "required": ["from", "to", "data", "status", "confirmed_by", "symptom_if_broken"],
+      "additionalProperties": false,
+      "properties": {
+        "from": { "$ref": "#/$defs/stackCategory" },
+        "to": { "$ref": "#/$defs/stackCategory" },
+        "data": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/integrationStatus" },
+        "confirmed_by": { "type": "string", "minLength": 1 },
+        "symptom_if_broken": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "gradeRow": {
+      "type": "object",
+      "required": ["dimension", "grade", "reasons", "improvement_to_next_grade"],
+      "additionalProperties": false,
+      "properties": {
+        "dimension": {
+          "type": "string",
+          "enum": [
+            "decision_support",
+            "data_flow_integrity",
+            "commercial_leverage",
+            "operational_friction",
+            "scalability_resilience"
+          ]
+        },
+        "grade": { "type": "string", "enum": ["A", "B", "C", "D", "E"] },
+        "reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "improvement_to_next_grade": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "gapRow": {
+      "type": "object",
+      "required": [
+        "gap_name",
+        "missing_or_broken_fact",
+        "operational_symptom",
+        "decision_impaired",
+        "risk_if_unchanged",
+        "owner_function",
+        "close_gap_action"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "gap_name": { "type": "string", "minLength": 1 },
+        "missing_or_broken_fact": { "type": "string", "minLength": 1 },
+        "operational_symptom": { "type": "string", "minLength": 1 },
+        "decision_impaired": { "type": "string", "minLength": 1 },
+        "risk_if_unchanged": { "type": "string", "minLength": 1 },
+        "owner_function": {
+          "type": "string",
+          "enum": ["revenue", "marketing", "operations", "finance", "leadership", "it"]
+        },
+        "close_gap_action": { "type": "string", "minLength": 1 },
+        "trigger": {
+          "type": "string",
+          "enum": ["system_missing", "integration_not_active", "process_gap_confirmed"]
+        }
+      }
+    },
+
+    "recommendationRow": {
+      "type": "object",
+      "required": ["gap_name", "enable_first_path", "tool_options", "selection_criteria", "market_risks"],
+      "additionalProperties": false,
+      "properties": {
+        "gap_name": { "type": "string", "minLength": 1 },
+        "enable_first_path": { "type": "string", "minLength": 1 },
+        "tool_options": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/toolOption" }
+        },
+        "selection_criteria": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "market_risks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/marketRisk" }
+        }
+      }
+    },
+
+    "toolOption": {
+      "type": "object",
+      "required": ["vendor", "why_fit", "tradeoffs"],
+      "additionalProperties": false,
+      "properties": {
+        "vendor": { "type": "string", "minLength": 1 },
+        "why_fit": { "type": "string", "minLength": 1 },
+        "tradeoffs": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "marketRisk": {
+      "type": "object",
+      "required": ["risk_statement", "source_refs"],
+      "additionalProperties": false,
+      "properties": {
+        "risk_statement": { "type": "string", "minLength": 1 },
+        "source_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+
+    "actionRow": {
+      "type": "object",
+      "required": ["action", "owner_role", "dependency", "outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "action": { "type": "string", "minLength": 1 },
+        "owner_role": { "type": "string", "minLength": 1 },
+        "dependency": { "type": "string", "minLength": 1 },
+        "outcome": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "publicSource": {
+      "type": "object",
+      "required": ["type", "title", "publisher", "date", "url_or_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["review", "forum", "vendor_doc", "case_study", "other"]
+        },
+        "title": { "type": "string", "minLength": 1 },
+        "publisher": { "type": "string", "minLength": 1 },
+        "date": { "type": "string", "minLength": 1 },
+        "url_or_ref": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
