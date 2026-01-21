@@ -1,0 +1,22 @@
+{
+  "vendor": "string",
+  "category": "one_of_known_categories",
+  "capability_type": "system | augmentation | automation",
+  "primary_functions": ["string"],
+  "required_integrations": ["stack_category"],
+  "optional_integrations": ["stack_category"],
+  "data_dependencies": ["string"],
+  "operational_dependencies": ["string"],
+  "common_risks": [
+    {
+      "risk": "string",
+      "source_type": "review | forum | analyst | vendor_doc",
+      "notes": "string"
+    }
+  ],
+  "ai_usage": {
+    "uses_ai": true,
+    "ai_role": "assistive | predictive | generative",
+    "human_in_loop_required": true
+  }
+}
