@@ -1,160 +1,140 @@
-from typing import Any, Dict, List, Tuple
+from __future__ import annotations
 
-LAYER_WEIGHTS: Dict[str, float] = {
-    "Distribution": 0.22,
-    "Core Systems": 0.20,
-    "Guest Data & CRM": 0.16,
-    "Commercial Execution": 0.14,
-    "In-Venue Experience": 0.10,
-    "Operations": 0.10,
-    "Finance & Reporting": 0.08,
-}
-
-# Scoring model:
-# - Base score reflects "capability likely exists" in hotels, but integration maturity unknown.
-# - Observed public signals raise the score.
-# - Customer-confirmed signals raise the score further (highest confidence).
-# - We never claim "absence"; we score maturity/visibility.
-BASELINE_SCORE_0_TO_5 = 2.4
-
-# Source multipliers
-SRC_MULTIPLIER = {
-    "customer_confirmed": 1.00,  # treat as strongest signal
-    "public_signal": 0.85,       # strong but limited to what’s visible
-    "inferred": 0.55,            # weaker: plausible but not proven
-    "unknown": 0.40,             # fallback if source missing
-}
-
-# Cap how many detections per layer influence the score
-TOP_N = 4
+from typing import Any, Dict, List
 
 
-def _safe_list(x: Any) -> List[Any]:
-    return x if isinstance(x, list) else []
+def _grade_from_score(score: int) -> str:
+    # 0–20 -> E, 21–40 -> D, 41–60 -> C, 61–80 -> B, 81–100 -> A
+    if score >= 81:
+        return "A"
+    if score >= 61:
+        return "B"
+    if score >= 41:
+        return "C"
+    if score >= 21:
+        return "D"
+    return "E"
 
 
-def _detection_strength(det: Dict[str, Any]) -> float:
+def _count_integration_status(integration_rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {"active": 0, "not_active": 0, "unknown": 0}
+    for r in integration_rows:
+        s = r.get("status")
+        if s == "active_confirmed":
+            counts["active"] += 1
+        elif s == "not_active_confirmed":
+            counts["not_active"] += 1
+        else:
+            counts["unknown"] += 1
+    return counts
+
+
+def _has_category(stack_rows: List[Dict[str, Any]], category: str) -> bool:
+    # Any vendor not None/Not provided counts as present
+    for r in stack_rows:
+        if r.get("category") == category:
+            v = (r.get("vendor") or "").strip().lower()
+            ev = r.get("evidence_level")
+            if ev in {"confirmed_self_reported", "confirmed_evidence_backed"} and v not in {"none", "not provided"}:
+                return True
+    return False
+
+
+def compute_grades(stack_rows: List[Dict[str, Any]], integration_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Compute a single detection strength in [0, 1.0] combining:
-    - confidence (0..1) from detector match
-    - source multiplier (customer_confirmed > public_signal > inferred)
+    Deterministic grading only.
+    - No benchmarks
+    - No external assumptions
+    - Uses: presence of core systems + integration status certainty
     """
-    if not isinstance(det, dict):
-        return 0.0
+    counts = _count_integration_status(integration_rows)
+    total_links = max(1, len(integration_rows))
 
-    conf = det.get("confidence")
-    try:
-        conf_f = float(conf)
-    except Exception:
-        conf_f = 0.0
+    # Decision support: penalise unknown integrations and missing BI
+    decision_score = 100
+    decision_score -= int((counts["unknown"] / total_links) * 60)
+    if not _has_category(stack_rows, "reporting_bi"):
+        decision_score -= 20
 
-    src = (det.get("source") or "unknown").strip().lower()
-    mult = SRC_MULTIPLIER.get(src, SRC_MULTIPLIER["unknown"])
+    # Data flow integrity: reward active links, penalise not active/unknown
+    flow_score = 100
+    flow_score -= counts["unknown"] * 8
+    flow_score -= counts["not_active"] * 12
+    flow_score = max(0, min(100, flow_score))
 
-    # Clamp confidence defensively
-    if conf_f < 0:
-        conf_f = 0.0
-    if conf_f > 1:
-        conf_f = 1.0
+    # Commercial leverage: RMS + CRM + Email presence (not their quality)
+    leverage_score = 40
+    if _has_category(stack_rows, "rms"):
+        leverage_score += 20
+    if _has_category(stack_rows, "crm_guest_db"):
+        leverage_score += 20
+    if _has_category(stack_rows, "email_lifecycle"):
+        leverage_score += 20
+    leverage_score = max(0, min(100, leverage_score))
 
-    return conf_f * mult
+    # Operational friction: task tools presence + unknown integrations
+    friction_score = 80
+    if not _has_category(stack_rows, "housekeeping_maintenance"):
+        friction_score -= 20
+    friction_score -= int((counts["unknown"] / total_links) * 30)
+    friction_score = max(0, min(100, friction_score))
 
+    # Scalability/resilience: ownership unknown / high unknown integration count penalises
+    resilience_score = 90
+    resilience_score -= counts["unknown"] * 6
+    resilience_score = max(0, min(100, resilience_score))
 
-def _layer_score_from_detections(detections: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
-    """
-    Returns (score_0_to_5, diagnostics)
-    """
-    dets = [d for d in _safe_list(detections) if isinstance(d, dict)]
-    if not dets:
-        return BASELINE_SCORE_0_TO_5, {
-            "state": "inferred_baseline",
-            "explanation": "No direct evidence observed for this layer in public signals; score reflects baseline capability typically present in hotels.",
-            "top_signals": [],
+    def row(dim: str, score: int, reasons: List[str], improve: str) -> Dict[str, Any]:
+        return {
+            "dimension": dim,
+            "grade": _grade_from_score(score),
+            "reasons": reasons,
+            "improvement_to_next_grade": improve,
         }
 
-    strengths = sorted([_detection_strength(d) for d in dets], reverse=True)
-    top_strengths = strengths[:TOP_N]
-    avg_strength = sum(top_strengths) / max(1, len(top_strengths))
-
-    # Convert avg_strength (0..1) into uplift (0..~2.4)
-    # Keeps score within [BASELINE, 5.0] and prevents over-scoring due to noisy tags.
-    uplift = avg_strength * 2.6
-    score = BASELINE_SCORE_0_TO_5 + uplift
-    if score > 5.0:
-        score = 5.0
-
-    # Diagnostics: show top detections (vendor/product/source/label)
-    top_dets = sorted(
-        dets,
-        key=lambda d: _detection_strength(d),
-        reverse=True,
-    )[:TOP_N]
-    top_signals = []
-    for d in top_dets:
-        top_signals.append({
-            "vendor": d.get("vendor"),
-            "product": d.get("product"),
-            "category": d.get("category"),
-            "confidence": d.get("confidence"),
-            "label": d.get("label"),
-            "source": d.get("source"),
-        })
-
-    # Determine state label
-    has_confirmed = any((d.get("source") == "customer_confirmed") for d in dets)
-    state = "confirmed" if has_confirmed else "observed"
-
-    return round(score, 2), {
-        "state": state,
-        "explanation": "Evidence observed for this layer; score reflects public visibility and signal strength.",
-        "top_signals": top_signals,
-    }
-
-
-def score_layers(detections_by_layer: Dict[str, List[dict]]) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "layer_scores": [
-          {"layer": ..., "score": x, "out_of": 5, "weight": w, "state": ..., "notes": ..., "signals": [...]},
-          ...
-        ],
-        "overall_score_0_to_100": ...
-      }
-
-    Compatible with report renderers expecting either:
-    - layer_scores[*].score + out_of
-    """
-    layer_scores: List[Dict[str, Any]] = []
-
-    for layer, weight in LAYER_WEIGHTS.items():
-        detections = detections_by_layer.get(layer, []) or []
-        score_0_to_5, diag = _layer_score_from_detections(detections)
-
-        layer_scores.append({
-            "layer": layer,
-            "score": score_0_to_5,
-            "out_of": 5,
-            "weight": weight,
-            "state": diag.get("state"),
-            "notes": diag.get("explanation"),
-            "signals": diag.get("top_signals", []),
-        })
-
-    overall = 0.0
-    for ls in layer_scores:
-        try:
-            s = float(ls.get("score", 0.0))
-            out_of = float(ls.get("out_of", 5.0))
-            w = float(ls.get("weight", 0.0))
-        except Exception:
-            continue
-
-        if out_of <= 0:
-            continue
-        overall += (s / out_of) * 100.0 * w
-
-    return {
-        "layer_scores": layer_scores,
-        "overall_score_0_to_100": round(overall, 1),
-    }
+    return [
+        row(
+            "decision_support",
+            decision_score,
+            reasons=[
+                "Grades are based on confirmed stack presence and confirmed integration statuses only.",
+                f"Integrations not yet confirmed: {counts['unknown']} out of {total_links}.",
+            ],
+            improve="Confirm integration statuses and ensure leadership reporting is produced from a consistent data source.",
+        ),
+        row(
+            "data_flow_integrity",
+            flow_score,
+            reasons=[
+                f"Active links confirmed: {counts['active']}.",
+                f"Links not active: {counts['not_active']}.",
+                f"Links not confirmed: {counts['unknown']}.",
+            ],
+            improve="Confirm each core system data flow and activate integrations where data is currently rekeyed or reconciled manually.",
+        ),
+        row(
+            "commercial_leverage",
+            leverage_score,
+            reasons=[
+                "This grade reflects presence of commercial capability tools only (not their configuration).",
+                "Higher scores require confirmed RMS + CRM + lifecycle marketing capability.",
+            ],
+            improve="Confirm and connect pricing, guest data, and lifecycle communications so commercial actions are measurable and repeatable.",
+        ),
+        row(
+            "operational_friction",
+            friction_score,
+            reasons=[
+                "This grade reflects likely manual burden implied by missing operational tooling and unconfirmed flows.",
+            ],
+            improve="Confirm operational workflow tooling and remove duplicated entry points between systems.",
+        ),
+        row(
+            "scalability_resilience",
+            resilience_score,
+            reasons=[
+                "This grade reflects how repeatable the stack is likely to be, based on confirmation completeness.",
+            ],
+            improve="Standardise system ownership (group vs property), document integrations, and reduce reliance on individual workarounds.",
+        ),
+    ]
